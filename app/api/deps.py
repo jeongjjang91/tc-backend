@@ -1,7 +1,7 @@
 from app.config import get_settings
 from app.infra.llm.internal_api import InternalLLMProvider
 from app.infra.llm.prompt_renderer import PromptRenderer
-from app.infra.db.oracle import OraclePool
+from app.infra.db.mysql import MySQLPool
 from app.infra.db.schema_store import SchemaStore
 from app.infra.db.value_store import ValueStore
 from app.infra.db.few_shot_store import FewShotStore
@@ -47,10 +47,16 @@ async def init_dependencies() -> None:
 
     validator = SQLValidator(whitelist=whitelist)
 
-    tc_pool = OraclePool(s.tc_db_dsn, s.tc_db_user, s.tc_db_password)
+    tc_pool = MySQLPool(
+        host=s.tc_db_host, port=s.tc_db_port, db=s.tc_db_name,
+        user=s.tc_db_user, password=s.tc_db_password,
+    )
     await tc_pool.start()
 
-    app_pool = OraclePool(s.app_db_dsn, s.app_db_user, s.app_db_password)
+    app_pool = MySQLPool(
+        host=s.app_db_host, port=s.app_db_port, db=s.app_db_name,
+        user=s.app_db_user, password=s.app_db_password,
+    )
     await app_pool.start()
 
     _session_repo = SessionRepository(app_pool)

@@ -9,13 +9,17 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "gpt-oss"
 
-    # Oracle App DB
-    app_db_dsn: str = "localhost:1521/APPDB"
+    # MySQL App DB (세션/메시지/feedback/few_shot)
+    app_db_host: str = "localhost"
+    app_db_port: int = 3306
+    app_db_name: str = "APPDB"
     app_db_user: str = "voc_app"
     app_db_password: str = ""
 
-    # Oracle TC DB (read-only)
-    tc_db_dsn: str = "localhost:1521/TCDB"
+    # MySQL TC DB (read-only, Text-to-SQL 대상)
+    tc_db_host: str = "localhost"
+    tc_db_port: int = 3307
+    tc_db_name: str = "TCDB"
     tc_db_user: str = "voc_readonly"
     tc_db_password: str = ""
 

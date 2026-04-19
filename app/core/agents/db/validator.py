@@ -5,8 +5,9 @@ from app.shared.exceptions import SQLValidationError
 
 
 class SQLValidator:
-    def __init__(self, whitelist: dict):
+    def __init__(self, whitelist: dict, dialect: str = "mysql"):
         self.whitelist = whitelist
+        self.dialect = dialect
         self.allowed_tables: set[str] = set(whitelist.get("tables", {}).keys())
         self.large_tables: set[str] = set(whitelist.get("large_tables", []))
         self.forbidden: list[str] = whitelist.get("forbidden_functions", [])
@@ -16,7 +17,7 @@ class SQLValidator:
 
         # 1. 파싱
         try:
-            tree = sqlglot.parse_one(sql, dialect="oracle")
+            tree = sqlglot.parse_one(sql, dialect=self.dialect)
         except Exception as e:
             raise SQLValidationError(f"SQL 파싱 실패: {e}", sql)
 

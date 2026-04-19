@@ -1,12 +1,12 @@
 import asyncio
-from app.infra.db.oracle import OraclePool
+from app.infra.db.base import DBPool
 from app.shared.logging import get_logger
 
 logger = get_logger(__name__)
 
 
 class ConfigPoller:
-    def __init__(self, app_pool: OraclePool, interval_sec: int = 30):
+    def __init__(self, app_pool: DBPool, interval_sec: int = 30):
         self.pool = app_pool
         self.interval = interval_sec
         self._versions: dict[str, int] = {}
