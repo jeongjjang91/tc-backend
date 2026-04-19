@@ -1,0 +1,19 @@
+examples:
+  - question: "A 설비에 PARAM_TEMP 기능 있나?"
+    sql: "SELECT COUNT(*) AS cnt FROM PARAMETER WHERE eqp_id = 'EQP_A_001' AND param_name = 'PARAM_TEMP' AND ROWNUM <= 1"
+
+  - question: "A 설비와 B 설비의 파라미터 차이가 뭐야?"
+    sql: |
+      SELECT a.param_name, CASE WHEN b.param_name IS NULL THEN 'B에 없음' ELSE '동일' END AS status
+      FROM PARAMETER a
+      LEFT JOIN PARAMETER b ON a.param_name = b.param_name AND b.eqp_id = 'EQP_B_001'
+      WHERE a.eqp_id = 'EQP_A_001' AND ROWNUM <= 100
+
+  - question: "A 설비의 DCOL_ITEM 목록 알려줘"
+    sql: "SELECT item_name, dev_status FROM DCOL_ITEM WHERE eqp_id = 'EQP_A_001' AND ROWNUM <= 100"
+
+  - question: "MODEL_INFO에서 A 설비 버전이 뭐야?"
+    sql: "SELECT version FROM MODEL_INFO WHERE eqp_id = 'EQP_A_001'"
+
+  - question: "A 설비에 개발 완료된 기능이 몇 개야?"
+    sql: "SELECT COUNT(*) AS cnt FROM DCOL_ITEM WHERE eqp_id = 'EQP_A_001' AND dev_status = 'DONE'"
