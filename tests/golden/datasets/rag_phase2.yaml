@@ -1,0 +1,81 @@
+baseline_score: null  # 실제 LLM 실행 후 고정
+
+cases:
+  - id: rag_001
+    difficulty: easy
+    question: "PARAM_TEMP 기능이 뭐야?"
+    expected:
+      agent: doc
+      answer_must_contain: ["PARAM_TEMP"]
+      citation_required: true
+      min_confidence: 0.6
+
+  - id: rag_002
+    difficulty: easy
+    question: "DCOL 기능 설명해줘"
+    expected:
+      agent: doc
+      citation_required: true
+      min_confidence: 0.5
+
+  - id: rag_003
+    difficulty: easy
+    question: "THRESHOLD 파라미터 어떻게 동작해?"
+    expected:
+      agent: doc
+      answer_must_contain: ["THRESHOLD"]
+      citation_required: true
+
+  - id: rag_004
+    difficulty: medium
+    question: "MODEL_INFO 테이블에서 설비 정보 어떻게 관리해?"
+    expected:
+      agent: doc
+      citation_required: true
+      min_confidence: 0.5
+
+  - id: rag_005
+    difficulty: medium
+    question: "DCOL_ITEM의 역할이 뭐야?"
+    expected:
+      agent: doc
+      answer_must_contain: ["DCOL_ITEM"]
+      citation_required: true
+
+  - id: rag_006
+    difficulty: medium
+    question: "파라미터 설정 방법을 설명해줘"
+    expected:
+      agent: doc
+      citation_required: true
+
+  - id: rag_007
+    difficulty: medium
+    question: "TC 시스템의 제어 흐름은 어떻게 되나요?"
+    expected:
+      agent: doc
+      citation_required: true
+      min_confidence: 0.4
+
+  - id: rag_008
+    difficulty: hard
+    question: "PARAM_X와 PARAM_Y의 차이점을 설명해줘"
+    expected:
+      agent: doc
+      citation_required: true
+      min_confidence: 0.4
+
+  - id: rag_009
+    difficulty: hard
+    question: "온도 제어 알고리즘의 동작 원리가 궁금해"
+    expected:
+      agent: doc
+      citation_required: true
+
+  - id: rag_010
+    difficulty: hard
+    question: "설비 캘리브레이션 절차를 알려줘"
+    expected:
+      agent: doc
+      citation_required: true
+      min_confidence: 0.3

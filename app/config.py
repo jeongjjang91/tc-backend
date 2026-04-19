@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     tc_db_user: str = "voc_readonly"
     tc_db_password: str = ""
 
+    # Confluence (Phase 2)
+    confluence_base_url: str = "http://localhost/confluence"
+    confluence_token: str = ""
+    confluence_space_key: str = "TC"
+
     # 설정
     config_dir: str = "config"
     confidence_threshold: float = 0.7
