@@ -1,0 +1,140 @@
+baseline_score: null  # 실제 LLM 실행 후 고정
+
+cases:
+  # ── Phase 1: DB Agent (Text-to-SQL) ──────────────────────────────────────────
+  - id: db_001
+    difficulty: easy
+    question: "MODEL_INFO 테이블에서 설비 목록 조회해줘"
+    expected:
+      agent: db
+      sql_must_contain: ["MODEL_INFO"]
+      citation_required: false
+      min_confidence: 0.6
+
+  - id: db_002
+    difficulty: easy
+    question: "PARAM_TEMP 파라미터 설정값 알려줘"
+    expected:
+      agent: db
+      sql_must_contain: ["PARAMETER"]
+      citation_required: false
+      min_confidence: 0.6
+
+  - id: db_003
+    difficulty: medium
+    question: "설비 A와 설비 B의 THRESHOLD 파라미터 비교해줘"
+    expected:
+      agent: db
+      citation_required: false
+      min_confidence: 0.5
+
+  - id: db_004
+    difficulty: medium
+    question: "DCOL_ITEM 중 활성화된 항목 몇 개야?"
+    expected:
+      agent: db
+      sql_must_contain: ["DCOL_ITEM"]
+      citation_required: false
+      min_confidence: 0.5
+
+  - id: db_005
+    difficulty: hard
+    question: "최근 30일간 파라미터 변경 이력 조회해줘"
+    expected:
+      agent: db
+      citation_required: false
+      min_confidence: 0.4
+
+  # ── Phase 2: RAG Agent (Confluence) ──────────────────────────────────────────
+  - id: rag_001
+    difficulty: easy
+    question: "PARAM_TEMP 기능이 뭐야?"
+    expected:
+      agent: doc
+      answer_must_contain: ["PARAM_TEMP"]
+      citation_required: true
+      min_confidence: 0.6
+
+  - id: rag_002
+    difficulty: easy
+    question: "DCOL 기능 설명해줘"
+    expected:
+      agent: doc
+      citation_required: true
+      min_confidence: 0.5
+
+  - id: rag_003
+    difficulty: medium
+    question: "TC 시스템의 제어 흐름은 어떻게 되나요?"
+    expected:
+      agent: doc
+      citation_required: true
+      min_confidence: 0.4
+
+  - id: rag_004
+    difficulty: hard
+    question: "온도 제어 알고리즘의 동작 원리가 궁금해"
+    expected:
+      agent: doc
+      citation_required: true
+      min_confidence: 0.3
+
+  # ── Phase 3: Splunk Agent (Log Analysis) ─────────────────────────────────────
+  - id: splunk_001
+    difficulty: easy
+    question: "TC01 설비에서 최근 에러 로그 찾아줘"
+    expected:
+      agent: log
+      citation_required: true
+      min_confidence: 0.5
+
+  - id: splunk_002
+    difficulty: medium
+    question: "TC 설비 오동작 원인이 뭐야?"
+    expected:
+      agent: log
+      citation_required: true
+      min_confidence: 0.4
+      review_may_be_required: true
+
+  - id: splunk_003
+    difficulty: hard
+    question: "TC02 설비 반복 오류의 근본 원인 분석해줘"
+    expected:
+      agent: log
+      citation_required: true
+      min_confidence: 0.3
+      review_may_be_required: true
+
+  # ── Phase 4: Knowledge Agent ──────────────────────────────────────────────────
+  - id: kb_001
+    difficulty: easy
+    question: "설비 운영 팁 알려줘"
+    expected:
+      agent: knowledge
+      citation_required: false
+      min_confidence: 0.5
+
+  - id: kb_002
+    difficulty: medium
+    question: "파라미터 설정 시 주의사항 FAQ"
+    expected:
+      agent: knowledge
+      citation_required: false
+      min_confidence: 0.4
+
+  # ── Cross-agent routing tests ─────────────────────────────────────────────────
+  - id: route_001
+    difficulty: easy
+    question: "설비 기능 있는지 확인해줘"
+    expected:
+      agent: db
+      min_confidence: 0.4
+
+  - id: route_002
+    difficulty: medium
+    question: "에러 로그 패턴 분석해줘"
+    expected:
+      agent: log
+      min_confidence: 0.3
+      review_may_be_required: true

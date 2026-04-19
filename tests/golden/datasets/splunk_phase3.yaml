@@ -1,0 +1,63 @@
+baseline_score: null  # 실제 LLM 실행 후 고정
+
+cases:
+  - id: splunk_001
+    difficulty: easy
+    question: "TC01 설비에서 최근 에러 로그 찾아줘"
+    expected:
+      agent: log
+      answer_must_contain: []
+      citation_required: true
+      min_confidence: 0.5
+
+  - id: splunk_002
+    difficulty: easy
+    question: "어제 발생한 온도 관련 오류 알려줘"
+    expected:
+      agent: log
+      citation_required: true
+      min_confidence: 0.5
+
+  - id: splunk_003
+    difficulty: medium
+    question: "TC 설비 오동작 원인이 뭐야?"
+    expected:
+      agent: log
+      citation_required: true
+      min_confidence: 0.4
+      review_may_be_required: true
+
+  - id: splunk_004
+    difficulty: medium
+    question: "지난 24시간 동안 가장 많이 발생한 에러 코드는?"
+    expected:
+      agent: log
+      citation_required: true
+      min_confidence: 0.5
+
+  - id: splunk_005
+    difficulty: medium
+    question: "설비 센서 이상 징후가 있는지 확인해줘"
+    expected:
+      agent: log
+      citation_required: true
+      min_confidence: 0.3
+      review_may_be_required: true
+
+  - id: splunk_006
+    difficulty: hard
+    question: "TC02 설비 반복 오류의 근본 원인 분석해줘"
+    expected:
+      agent: log
+      citation_required: true
+      min_confidence: 0.3
+      review_may_be_required: true
+
+  - id: splunk_007
+    difficulty: hard
+    question: "최근 일주일간 이상 패턴 분석 보고서 만들어줘"
+    expected:
+      agent: log
+      citation_required: true
+      min_confidence: 0.3
+      review_may_be_required: true

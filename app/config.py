@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     confluence_token: str = ""
     confluence_space_key: str = "TC"
 
+    # Splunk (Phase 3)
+    splunk_host: str = "localhost"
+    splunk_port: int = 8089
+    splunk_token: str = ""
+    splunk_index: str = "main"
+
     # 설정
     config_dir: str = "config"
     confidence_threshold: float = 0.7

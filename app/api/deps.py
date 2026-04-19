@@ -6,8 +6,10 @@ from app.infra.db.schema_store import SchemaStore
 from app.infra.db.value_store import ValueStore
 from app.infra.db.few_shot_store import FewShotStore
 from app.infra.db.sessions import SessionRepository
+from app.infra.db.review_repo import ReviewRepository
 from app.infra.rag.confluence_client import ConfluenceClient
 from app.infra.rag.reranker import TFIDFReranker
+from app.infra.splunk.client import SplunkClient
 from app.infra.config.loader import ConfigLoader
 from app.core.agents.db.schema_linker import SchemaLinker
 from app.core.agents.db.sql_generator import SQLGenerator
@@ -16,12 +18,17 @@ from app.core.agents.db.refiner import SQLRefiner
 from app.core.agents.db.interpreter import ResultInterpreter
 from app.core.agents.db.agent import DBAgent
 from app.core.agents.rag.agent import RAGAgent
+from app.core.agents.log.agent import SplunkAgent
+from app.core.agents.knowledge.agent import KnowledgeAgent
+from app.infra.db.knowledge_repo import KnowledgeRepository
 from app.core.orchestrator.planner import QueryPlanner
 from app.core.orchestrator.executor import QueryExecutor
 
 _db_agent: DBAgent | None = None
 _rag_agent: RAGAgent | None = None
+_splunk_agent: SplunkAgent | None = None
 _session_repo: SessionRepository | None = None
+_review_repo: ReviewRepository | None = None
 _planner: QueryPlanner | None = None
 _executor: QueryExecutor | None = None
 
@@ -34,8 +41,16 @@ async def get_rag_agent() -> RAGAgent:
     return _rag_agent
 
 
+async def get_splunk_agent() -> SplunkAgent:
+    return _splunk_agent
+
+
 async def get_session_repo() -> SessionRepository:
     return _session_repo
+
+
+async def get_review_repo() -> ReviewRepository:
+    return _review_repo
 
 
 async def get_planner() -> QueryPlanner:
@@ -47,7 +62,7 @@ async def get_executor() -> QueryExecutor:
 
 
 async def init_dependencies() -> None:
-    global _db_agent, _rag_agent, _session_repo, _planner, _executor
+    global _db_agent, _rag_agent, _splunk_agent, _session_repo, _review_repo, _planner, _executor
     s = get_settings()
     loader = ConfigLoader(s.config_dir)
     thresholds = loader.load_thresholds()
@@ -80,6 +95,7 @@ async def init_dependencies() -> None:
     await app_pool.start()
 
     _session_repo = SessionRepository(app_pool)
+    _review_repo = ReviewRepository(app_pool)
 
     _db_agent = DBAgent(
         linker=SchemaLinker(llm, renderer, schema_store, thresholds.get("schema_rag_top_k", 5)),
@@ -107,5 +123,30 @@ async def init_dependencies() -> None:
         top_k=thresholds.get("rag_top_k", 5),
     )
 
-    _planner = QueryPlanner()
-    _executor = QueryExecutor(agent_instances={"db": _db_agent, "doc": _rag_agent})
+    splunk = SplunkClient(
+        host=s.splunk_host,
+        port=s.splunk_port,
+        token=s.splunk_token,
+        index=s.splunk_index,
+    )
+    _splunk_agent = SplunkAgent(
+        llm=llm,
+        renderer=renderer,
+        splunk=splunk,
+        review_repo=_review_repo,
+        splunk_index=s.splunk_index,
+        review_threshold=thresholds.get("review_threshold", 0.6),
+    )
+
+    knowledge_repo = KnowledgeRepository(app_pool)
+    _knowledge_agent = KnowledgeAgent(
+        llm=llm,
+        renderer=renderer,
+        knowledge_repo=knowledge_repo,
+        top_k=thresholds.get("knowledge_top_k", 5),
+    )
+
+    _planner = QueryPlanner(llm=llm, renderer=renderer)
+    _executor = QueryExecutor(
+        agent_instances={"db": _db_agent, "doc": _rag_agent, "log": _splunk_agent, "knowledge": _knowledge_agent}
+    )
