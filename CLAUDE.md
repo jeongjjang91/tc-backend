@@ -8,8 +8,8 @@ TC 시스템 운영팀이 받는 VOC를 사내 오픈소스 LLM(GPT-OSS, Gemma4)
 
 - **Backend:** FastAPI (Python, async)
 - **Frontend:** Vue.js + Vite (별도 레포, SSE 챗봇 UI)
-- **App DB:** Oracle (운영/세션/지식 일체. **Redis 등 추가 인프라 사용 금지** — 운영 부담 최소화)
-- **데이터 소스:** Oracle TC DB(MODEL/PARAMETER/DCOL_ITEM 등), 사내 RAG API(Confluence), Splunk API
+- **App DB:** MySQL 8.0 (세션/메시지/feedback/few_shot 저장. **Redis 등 추가 인프라 사용 금지** — 운영 부담 최소화. 규모 확장 시 Oracle 이전 가능하도록 `DBPool` ABC 추상화 유지)
+- **데이터 소스:** TC DB — MySQL 8.0 (MODEL/PARAMETER/DCOL_ITEM 등, read-only), 사내 RAG API(Confluence), Splunk API
 - **LLM:** 사내 오픈소스 LLM API (파인튜닝 불가)
 
 ## VOC 4개 유형
@@ -87,7 +87,7 @@ app/
 │   └── synthesizer.py
 ├── infra/       # 외부 의존성 어댑터
 │   ├── llm/     # Provider 인터페이스 (사내 LLM API)
-│   ├── db/      # Oracle (read-only)
+│   ├── db/      # MySQL (DBPool ABC + MySQLPool, OraclePool은 미래용 보존)
 │   ├── rag/     # 사내 RAG API + Reranker
 │   └── splunk/
 ├── eval/        # Golden Dataset 평가 러너
