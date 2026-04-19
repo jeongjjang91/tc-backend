@@ -1,0 +1,14 @@
+services:
+  oracle-test:
+    image: gvenzl/oracle-free:23-slim
+    environment:
+      ORACLE_PASSWORD: testpass
+      APP_USER: voc_app
+      APP_USER_PASSWORD: testpass
+    ports:
+      - "1521:1521"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
