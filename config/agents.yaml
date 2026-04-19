@@ -1,0 +1,10 @@
+agents:
+  db:
+    enabled: true
+    description: "TC Oracle DB Text-to-SQL 에이전트"
+  doc:
+    enabled: false
+  log:
+    enabled: false
+  knowledge:
+    enabled: false

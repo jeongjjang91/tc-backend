@@ -1,0 +1,12 @@
+tables:
+  PARAMETER:
+    columns: [param_id, param_name, eqp_id, created_at]
+    requires_where_clause: true
+  MODEL_INFO:
+    columns: [eqp_id, model_name, version, created_at]
+    requires_where_clause: false
+  DCOL_ITEM:
+    columns: [item_id, item_name, eqp_id, dev_status, created_at]
+    requires_where_clause: true
+large_tables: [DCOL_LOG, EVENT_HISTORY]
+forbidden_functions: ["DBMS_", "UTL_", "EXEC"]
