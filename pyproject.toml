@@ -30,6 +30,9 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "real_llm: requires a live LLM endpoint (deselect with -m 'not real_llm')",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
