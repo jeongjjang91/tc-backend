@@ -1,0 +1,58 @@
+tables:
+  PARAMETER:
+    description: "설비별 파라미터 정의 마스터. 한 설비당 다수 행."
+    columns:
+      param_id:
+        type: NUMBER
+        description: "파라미터 고유 ID"
+      param_name:
+        type: VARCHAR2
+        description: "파라미터 명칭. 'PARAM_*' 형식."
+      eqp_id:
+        type: VARCHAR2
+        description: "설비 ID"
+        glossary_hint: "사용자가 'A 설비'라고 하면 EQP_A_* 패턴으로 검색"
+      created_at:
+        type: TIMESTAMP
+        description: "생성 일시"
+    relationships:
+      - "PARAMETER.eqp_id = MODEL_INFO.eqp_id"
+
+  MODEL_INFO:
+    description: "설비 모델 정보. 설비당 1행."
+    columns:
+      eqp_id:
+        type: VARCHAR2
+        description: "설비 고유 ID. 'EQP_<영역>_<번호>' 형식."
+        glossary_hint: "사용자가 '설비' 또는 장비명으로 질문할 때 이 컬럼으로 JOIN"
+      model_name:
+        type: VARCHAR2
+        description: "모델명"
+      version:
+        type: VARCHAR2
+        description: "TC 버전"
+      created_at:
+        type: TIMESTAMP
+        description: "등록 일시"
+    relationships: []
+
+  DCOL_ITEM:
+    description: "설비별 개발 완료된 기능(DCOL) 항목. 기능 개발 이력 확인용."
+    columns:
+      item_id:
+        type: NUMBER
+        description: "항목 고유 ID"
+      item_name:
+        type: VARCHAR2
+        description: "기능명. 'DCOL_*' 형식."
+      eqp_id:
+        type: VARCHAR2
+        description: "설비 ID"
+      dev_status:
+        type: VARCHAR2
+        description: "개발 상태. 'DONE'/'IN_PROGRESS'/'PENDING'"
+      created_at:
+        type: TIMESTAMP
+        description: "개발 완료 일시"
+    relationships:
+      - "DCOL_ITEM.eqp_id = MODEL_INFO.eqp_id"

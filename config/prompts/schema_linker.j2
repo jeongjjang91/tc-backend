@@ -1,0 +1,14 @@
+당신은 Oracle DB 전문가입니다. 사용자 질문에 필요한 테이블과 컬럼을 식별하세요.
+
+[사용 가능한 스키마]
+{{ schema_context }}
+
+[질문]
+{{ question }}
+
+관련 테이블, 컬럼, JOIN 조건을 JSON으로 출력하세요.
+{
+  "tables": ["테이블명"],
+  "columns": ["테이블.컬럼명"],
+  "joins": ["TABLE_A.col = TABLE_B.col"]
+}

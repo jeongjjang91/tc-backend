@@ -1,0 +1,228 @@
+baseline_score: null
+examples:
+  # === EASY (15개) ===
+  - id: db_001
+    difficulty: easy
+    question: "A 설비에 PARAM_TEMP 기능 있나?"
+    expected:
+      answer_must_contain: ["PARAM_TEMP"]
+      sql_must_filter_on: ["eqp_id", "param_name"]
+      citation_required: true
+
+  - id: db_002
+    difficulty: easy
+    question: "EQP_B_001 설비의 모델명이 뭐야?"
+    expected:
+      answer_must_contain: ["model_name"]
+      sql_must_use_table: "MODEL_INFO"
+      citation_required: true
+
+  - id: db_003
+    difficulty: easy
+    question: "A 설비의 TC 버전이 뭐야?"
+    expected:
+      answer_must_contain: ["version"]
+      sql_must_use_table: "MODEL_INFO"
+      citation_required: true
+
+  - id: db_004
+    difficulty: easy
+    question: "A 설비에 개발 완료된 기능 목록 알려줘"
+    expected:
+      sql_must_use_table: "DCOL_ITEM"
+      sql_must_filter_on: ["eqp_id", "dev_status"]
+      citation_required: true
+
+  - id: db_005
+    difficulty: easy
+    question: "EQP_A_001에 PARAM_PRESSURE 파라미터 있어?"
+    expected:
+      sql_must_filter_on: ["eqp_id", "param_name"]
+      citation_required: true
+
+  - id: db_006
+    difficulty: easy
+    question: "A 설비 파라미터 개수가 몇 개야?"
+    expected:
+      sql_must_contain: ["COUNT"]
+      citation_required: true
+
+  - id: db_007
+    difficulty: easy
+    question: "DCOL_ITEM에서 A 설비 개발 중인 항목 알려줘"
+    expected:
+      sql_must_filter_on: ["eqp_id", "dev_status"]
+      citation_required: true
+
+  - id: db_008
+    difficulty: easy
+    question: "MODEL_INFO에서 A 설비 정보 전체 보여줘"
+    expected:
+      sql_must_use_table: "MODEL_INFO"
+      sql_must_filter_on: ["eqp_id"]
+      citation_required: true
+
+  - id: db_009
+    difficulty: easy
+    question: "A 설비에 DCOL_X 기능 개발 완료됐어?"
+    expected:
+      sql_must_filter_on: ["eqp_id", "item_name", "dev_status"]
+      citation_required: true
+
+  - id: db_010
+    difficulty: easy
+    question: "EQP_A_001 설비 언제 등록됐어?"
+    expected:
+      sql_must_filter_on: ["eqp_id"]
+      answer_must_contain: ["created_at"]
+      citation_required: true
+
+  - id: db_011
+    difficulty: easy
+    question: "A 설비 파라미터 목록 보여줘"
+    expected:
+      sql_must_use_table: "PARAMETER"
+      sql_must_filter_on: ["eqp_id"]
+      citation_required: true
+
+  - id: db_012
+    difficulty: easy
+    question: "PARAM_FLOW라는 파라미터가 어느 설비에 있어?"
+    expected:
+      sql_must_filter_on: ["param_name"]
+      citation_required: true
+
+  - id: db_013
+    difficulty: easy
+    question: "A 설비 완료 기능 수 세줘"
+    expected:
+      sql_must_contain: ["COUNT"]
+      sql_must_filter_on: ["dev_status"]
+      citation_required: true
+
+  - id: db_014
+    difficulty: easy
+    question: "EQP_B_001의 파라미터 종류가 몇 가지야?"
+    expected:
+      sql_must_contain: ["COUNT"]
+      sql_must_filter_on: ["eqp_id"]
+      citation_required: true
+
+  - id: db_015
+    difficulty: easy
+    question: "A 설비 버전 정보 알려줘"
+    expected:
+      sql_must_use_table: "MODEL_INFO"
+      citation_required: true
+
+  # === MEDIUM (10개) ===
+  - id: db_016
+    difficulty: medium
+    question: "A 설비와 B 설비의 파라미터 차이가 뭐야?"
+    expected:
+      sql_must_use_table: "PARAMETER"
+      sql_must_contain: ["JOIN"]
+      citation_required: true
+
+  - id: db_017
+    difficulty: medium
+    question: "A 설비에는 있고 B 설비에는 없는 파라미터가 뭐야?"
+    expected:
+      sql_must_contain: ["NOT IN", "NOT EXISTS", "LEFT JOIN"]
+      citation_required: true
+
+  - id: db_018
+    difficulty: medium
+    question: "A 설비와 B 설비의 DCOL_ITEM이 동일한가요?"
+    expected:
+      sql_must_use_table: "DCOL_ITEM"
+      citation_required: true
+
+  - id: db_019
+    difficulty: medium
+    question: "모든 설비 중 PARAM_TEMP가 없는 설비는?"
+    expected:
+      sql_must_filter_on: ["param_name"]
+      sql_must_contain: ["NOT", "LEFT JOIN"]
+      citation_required: true
+
+  - id: db_020
+    difficulty: medium
+    question: "A 설비의 파라미터 중 B 설비에도 있는 것만 보여줘"
+    expected:
+      sql_must_use_table: "PARAMETER"
+      sql_must_contain: ["JOIN", "IN", "EXISTS"]
+      citation_required: true
+
+  - id: db_021
+    difficulty: medium
+    question: "DCOL_ITEM이 가장 많은 설비는?"
+    expected:
+      sql_must_contain: ["COUNT", "GROUP BY", "ORDER BY"]
+      citation_required: true
+
+  - id: db_022
+    difficulty: medium
+    question: "A 설비의 DCOL과 파라미터 수를 같이 보여줘"
+    expected:
+      sql_must_contain: ["JOIN", "COUNT"]
+      citation_required: true
+
+  - id: db_023
+    difficulty: medium
+    question: "최근에 추가된 파라미터 10개 알려줘"
+    expected:
+      sql_must_filter_on: ["created_at"]
+      sql_must_contain: ["ORDER BY"]
+      citation_required: true
+
+  - id: db_024
+    difficulty: medium
+    question: "A 설비와 C 설비의 버전 비교해줘"
+    expected:
+      sql_must_use_table: "MODEL_INFO"
+      sql_must_contain: ["JOIN", "WHERE", "IN"]
+      citation_required: true
+
+  - id: db_025
+    difficulty: medium
+    question: "파라미터가 10개 이상인 설비 목록"
+    expected:
+      sql_must_contain: ["COUNT", "GROUP BY", "HAVING"]
+      citation_required: true
+
+  # === HARD (5개) ===
+  - id: db_026
+    difficulty: hard
+    question: "A 설비에만 있고 B, C 설비에는 없는 파라미터는?"
+    expected:
+      sql_must_contain: ["NOT"]
+      citation_required: true
+
+  - id: db_027
+    difficulty: hard
+    question: "DCOL 개발 완료율이 가장 높은 설비 상위 3개"
+    expected:
+      sql_must_contain: ["COUNT", "GROUP BY", "ORDER BY"]
+      citation_required: true
+
+  - id: db_028
+    difficulty: hard
+    question: "모든 설비에 공통으로 있는 파라미터는?"
+    expected:
+      sql_must_contain: ["GROUP BY", "COUNT", "HAVING"]
+      citation_required: true
+
+  - id: db_029
+    difficulty: hard
+    question: "A 설비의 파라미터 중 다른 어떤 설비에도 없는 고유 파라미터는?"
+    expected:
+      sql_must_contain: ["NOT", "EXISTS", "IN"]
+      citation_required: true
+
+  - id: db_030
+    difficulty: hard
+    question: "파라미터 수와 DCOL 완료 수를 설비별로 비교한 표 만들어줘"
+    expected:
+      sql_must_contain: ["JOIN", "COUNT", "GROUP BY"]
+      citation_required: true

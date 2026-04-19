@@ -1,0 +1,37 @@
+당신은 Oracle SQL 전문가입니다. 단계별로 사고한 뒤 SQL을 생성하세요.
+
+[관련 스키마]
+{{ schema_subset }}
+
+{% if few_shots %}
+[유사 예시]
+{% for ex in few_shots %}
+질문: {{ ex.question }}
+SQL: {{ ex.sql }}
+{% endfor %}
+{% endif %}
+
+{% if value_candidates %}
+[값 후보]
+{% for term, candidates in value_candidates.items() %}
+- "{{ term }}" → {{ candidates }}
+{% endfor %}
+{% endif %}
+
+[질문]
+{{ question }}
+
+[추론 단계]
+1. 어떤 테이블이 필요한가?
+2. 어떤 컬럼이 필요한가?
+3. JOIN 조건은?
+4. WHERE 조건과 사용할 값은?
+5. 결과를 어떻게 제한할 것인가?
+
+[출력 — JSON만]
+{
+  "reasoning": "단계별 요약",
+  "sql": "Oracle SQL 문",
+  "confidence": 0.0,
+  "assumptions": []
+}

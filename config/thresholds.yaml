@@ -1,0 +1,6 @@
+confidence_auto_send: 0.70
+max_refine_attempts: 2
+schema_rag_top_k: 5
+few_shot_top_k: 3
+value_retrieval_top_n: 5
+cache_ttl_db_sec: 3600
