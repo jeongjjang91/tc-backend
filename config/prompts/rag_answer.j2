@@ -1,0 +1,18 @@
+아래 문서를 바탕으로 질문에 답하세요.
+
+[규칙]
+1. 모든 주장에 [doc_N] 형식의 인용 포함
+2. 문서에 없는 내용 추가 금지
+3. 정보가 없으면 "문서에서 확인되지 않습니다" 답변
+
+[질문]
+{{ question }}
+
+[문서]
+{% for doc in docs %}
+[doc_{{ loop.index }}] 제목: {{ doc.title }}
+{{ doc.content }}
+{% endfor %}
+
+JSON으로 출력:
+{"answer": "인용 포함 답변", "confidence": 0.0, "needs_human_review": false}
