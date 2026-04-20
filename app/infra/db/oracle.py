@@ -55,7 +55,7 @@ class OraclePool:
         # directly (no await needed), but the await is harmless there since we can
         # adjust if needed in the integration layer.
         try:
-            async with asyncio.timeout(self.timeout_sec):
+            async def _fetch():
                 conn = await self._get_conn()
                 try:
                     async with await conn.cursor() as cur:
@@ -66,15 +66,15 @@ class OraclePool:
                 finally:
                     if self._pool is not None:
                         await self._pool.release(conn)
+            return await asyncio.wait_for(_fetch(), timeout=self.timeout_sec)
         except asyncio.TimeoutError:
             raise DBExecutionError(f"Query timed out after {self.timeout_sec}s")
         except oracledb.Error as e:
             raise DBExecutionError(str(e)) from e
 
     async def execute(self, sql: str, params: dict | None = None) -> None:
-        """INSERT/UPDATE/DELETE 전용. 결과 fetch 없이 commit."""
         try:
-            async with asyncio.timeout(self.timeout_sec):
+            async def _exec():
                 conn = await self._get_conn()
                 try:
                     async with await conn.cursor() as cur:
@@ -83,6 +83,7 @@ class OraclePool:
                 finally:
                     if self._pool is not None:
                         await self._pool.release(conn)
+            await asyncio.wait_for(_exec(), timeout=self.timeout_sec)
         except asyncio.TimeoutError:
             raise DBExecutionError(f"Query timed out after {self.timeout_sec}s")
         except oracledb.Error as e:

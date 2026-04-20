@@ -55,24 +55,25 @@ class MySQLPool(DBPool):
         self, sql: str, params: dict | None = None, *, max_rows: int = 1000
     ) -> list[dict[str, Any]]:
         try:
-            async with asyncio.timeout(self.timeout_sec):
+            async def _fetch():
                 async with self._pool.acquire() as conn:
                     async with conn.cursor(aiomysql.DictCursor) as cur:
                         await cur.execute(sql, params or ())
                         return list(await cur.fetchmany(max_rows))
+            return await asyncio.wait_for(_fetch(), timeout=self.timeout_sec)
         except asyncio.TimeoutError:
             raise DBExecutionError(f"Query timed out after {self.timeout_sec}s")
         except aiomysql.Error as e:
             raise DBExecutionError(str(e)) from e
 
     async def execute(self, sql: str, params: dict | None = None) -> None:
-        """INSERT/UPDATE/DELETE 전용. 결과 fetch 없이 commit."""
         try:
-            async with asyncio.timeout(self.timeout_sec):
+            async def _exec():
                 async with self._pool.acquire() as conn:
                     async with conn.cursor() as cur:
                         await cur.execute(sql, params or ())
                         await conn.commit()
+            await asyncio.wait_for(_exec(), timeout=self.timeout_sec)
         except asyncio.TimeoutError:
             raise DBExecutionError(f"Query timed out after {self.timeout_sec}s")
         except aiomysql.Error as e:
