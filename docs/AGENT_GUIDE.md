@@ -16,7 +16,7 @@
 8. [테스트 전략](#8-테스트-전략)
 9. [사내 시스템 연동 포인트](#9-사내-시스템-연동-포인트)
 10. [Phase 1 사내 마무리 작업](#10-phase-1-사내-마무리-작업)
-11. [개발/운영 DB 환경 분리 (MySQL ↔ Oracle)](#11-개발운영-db-환경-분리-mysql--oracle)
+11. [DB 환경 (MySQL 개발, 향후 Oracle 이전 가능)](#11-db-환경-mysql-개발-향후-oracle-이전-가능)
 12. [실행 커맨드 치트시트](#12-실행-커맨드-치트시트)
 13. [API 사용 예시](#13-api-사용-예시)
 14. [Phase 2~4 구현 가이드](#14-phase-24-구현-가이드)
@@ -49,8 +49,10 @@ pip install -e ".[dev]"
 cp .env.example .env
 # vim .env  # 실제 값 기입
 
-# 4. Oracle 마이그레이션 (DBA에게 요청하거나 직접)
-sqlplus voc_app/비번@APPDB @db/migrations/001_initial.sql
+# 4. MySQL 마이그레이션 (DBA에게 요청하거나 직접)
+mysql -h 호스트 -u voc_app -p APPDB < db/migrations/001_initial.sql
+mysql -h 호스트 -u voc_app -p APPDB < db/migrations/002_review_flow.sql
+mysql -h 호스트 -u voc_app -p APPDB < db/migrations/003_knowledge.sql
 
 # 5. 유닛 테스트 — DB/LLM 없이 통과해야 함
 pytest tests/unit -v
@@ -102,7 +104,7 @@ app/
 │   └── orchestrator/       ← 비어있음 (Phase 2~4에서 구현)
 ├── infra/
 │   ├── llm/                LLMProvider ABC + InternalLLMProvider (httpx)
-│   ├── db/                 OraclePool, SchemaStore, ValueStore, FewShotStore
+│   ├── db/                 MySQLPool (DBPool ABC), SchemaStore, ValueStore, FewShotStore
 │   └── config/             ConfigLoader (YAML), ConfigPoller (30초 폴링)
 └── shared/
     ├── schemas.py          SubQuery, AgentResult, Evidence, Context, ChatRequest
@@ -150,7 +152,7 @@ class RAGAgent(Agent):
 
 ### 3-2. 인프라 어댑터 패턴
 
-외부 시스템(Oracle, LLM, Splunk, Confluence)은 반드시 `app/infra/` 아래에 격리합니다.
+외부 시스템(MySQL, LLM, Splunk, Confluence)은 반드시 `app/infra/` 아래에 격리합니다.
 `app/core/`는 `app/infra/`에 의존하지만, 반대는 안 됩니다.
 
 ```python
@@ -184,7 +186,7 @@ event: error      {"message": "오류 내용"}
 |------|------|------|-----------|
 | Code | `app/` | Agent 로직, 인터페이스 | PR + 배포 |
 | YAML | `config/` | 프롬프트, 화이트리스트, 임계값 | PR + 재시작 |
-| DB | Oracle `few_shot_bank` 등 | few-shot, 임계값 오버라이드 | 운영 중 핫리로드 |
+| DB | MySQL `few_shot_bank` 등 | few-shot, 임계값 오버라이드 | 운영 중 핫리로드 |
 
 ---
 
@@ -408,22 +410,34 @@ LLM_API_BASE_URL=http://내부LLM서버/v1
 LLM_API_KEY=실제키
 LLM_MODEL=gpt-oss   # 또는 gemma4
 
-# Oracle App DB (세션/로그 저장)
-APP_DB_DSN=사내Oracle호스트:1521/APPDB
+# MySQL App DB (세션/로그/few-shot 저장)
+APP_DB_HOST=사내MySQL호스트
+APP_DB_PORT=3306
+APP_DB_NAME=APPDB
 APP_DB_USER=voc_app
 APP_DB_PASSWORD=실제비밀번호
 
-# Oracle TC DB (read-only, Text-to-SQL 대상)
-TC_DB_DSN=tc-oracle-호스트:1521/TCDB
+# MySQL TC DB (read-only, Text-to-SQL 대상)
+TC_DB_HOST=tc-mysql-호스트
+TC_DB_PORT=3306
+TC_DB_NAME=TCDB
 TC_DB_USER=voc_readonly
 TC_DB_PASSWORD=실제비밀번호
+
+# Splunk (Phase 3)
+SPLUNK_HOST=splunk.사내호스트
+SPLUNK_PORT=8089
+SPLUNK_TOKEN=실제토큰
+SPLUNK_INDEX=tc_logs
 ```
 
-### Oracle 초기 설정
+### MySQL 초기 설정
 
 ```bash
-# DDL 실행 (DBA에게 요청)
-sqlplus voc_app@APPDB @db/migrations/001_initial.sql
+# DDL 실행 (DBA에게 요청 또는 직접)
+mysql -h 사내MySQL호스트 -u voc_app -p APPDB < db/migrations/001_initial.sql
+mysql -h 사내MySQL호스트 -u voc_app -p APPDB < db/migrations/002_review_flow.sql
+mysql -h 사내MySQL호스트 -u voc_app -p APPDB < db/migrations/003_knowledge.sql
 
 # whitelist 실제 TC DB 테이블/컬럼으로 수정
 vim config/whitelist.yaml
@@ -454,19 +468,20 @@ SPLUNK_INDEX = "tc_events"   # 실제 인덱스명
 ```python
 # scripts/verify_connections.py (직접 만들거나 REPL에서 실행)
 
-# 1. Oracle App DB
-import asyncio, oracledb
+# 1. MySQL App DB
+import asyncio, aiomysql
 async def ping_db():
-    pool = oracledb.create_pool_async(
-        dsn="실제DSN", user="voc_app", password="비번", min=1, max=2
+    conn = await aiomysql.connect(
+        host="사내MySQL호스트", port=3306,
+        user="voc_app", password="비번", db="APPDB"
     )
-    async with pool.acquire() as conn:
-        cur = conn.cursor()
-        await cur.execute("SELECT 1 FROM DUAL")
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT 1")
         print("App DB OK:", await cur.fetchone())
+    conn.close()
 asyncio.run(ping_db())
 
-# 2. Oracle TC DB (read-only) — whitelist 테이블 1개만 읽어보기
+# 2. MySQL TC DB (read-only) — whitelist 테이블 1개만 읽어보기
 # PARAMETER 테이블이 실제로 있는지 확인
 
 # 3. 사내 LLM API
@@ -486,18 +501,18 @@ print("LLM:", r.status_code, r.json()["choices"][0]["message"]["content"][:50])
 
 ## 10. Phase 1 사내 마무리 작업
 
-Phase 1 코드는 **외부에서 완성되어 있지만**, 사내로 가져와 실제 인프라(TC Oracle DB, 사내 LLM, Confluence/Splunk)와 연결하려면 아래 작업이 남아 있습니다. 순서대로 진행 권장.
+Phase 1~4 코드는 **완성되어 있지만**, 사내로 가져와 실제 인프라(TC MySQL DB, 사내 LLM, Confluence/Splunk)와 연결하려면 아래 작업이 남아 있습니다. 순서대로 진행 권장.
 
 ### 10-1. 실제 TC DB 스키마 반영
 
-`config/schema/tc_oracle.yaml` — 현재는 샘플 3개 테이블(PARAMETER/MODEL_INFO/DCOL_ITEM). **실제 TC DB 스키마로 교체 필요.**
+`config/schema/tc_schema.yaml` — 현재는 샘플 3개 테이블(PARAMETER/MODEL_INFO/DCOL_ITEM). **실제 TC DB 스키마로 교체 필요.**
 
 ```sql
--- DBA에게 요청해서 추출
-SELECT table_name, column_name, data_type, comments
-FROM all_tab_columns c
-LEFT JOIN all_col_comments cc USING (owner, table_name, column_name)
-WHERE owner = 'TC_OWNER';
+-- DBA에게 요청해서 추출 (MySQL)
+SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_COMMENT
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'TCDB'
+ORDER BY TABLE_NAME, ORDINAL_POSITION;
 ```
 
 추출 결과를 yaml로 변환:
@@ -507,7 +522,7 @@ tables:
     description: "테이블 설명 (LLM이 읽음)"
     columns:
       - name: 실제_컬럼명
-        type: VARCHAR2(200)
+        type: VARCHAR(200)
         description: "컬럼 설명 (중요 — LLM 정확도에 직결)"
         sample_values: ["예시1", "예시2"]  # 선택사항
 ```
@@ -539,14 +554,14 @@ max_limit: 1000                          # SELECT 자동 LIMIT
 ```python
 # 기동 시 TC DB에서 실제 값 로드
 eqp_rows = await tc_pool.fetch_all(
-    "SELECT DISTINCT EQP_NAME FROM MODEL_INFO WHERE ROWNUM <= 5000"
+    "SELECT DISTINCT EQP_NAME FROM MODEL_INFO LIMIT 5000"
 )
 param_rows = await tc_pool.fetch_all(
-    "SELECT DISTINCT PARAM_NAME FROM PARAMETER WHERE ROWNUM <= 20000"
+    "SELECT DISTINCT PARAM_NAME FROM PARAMETER LIMIT 20000"
 )
 value_store.load_values({
-    "EQP_NAME": [r[0] for r in eqp_rows],
-    "PARAM_NAME": [r[0] for r in param_rows],
+    "EQP_NAME": [r["EQP_NAME"] for r in eqp_rows],
+    "PARAM_NAME": [r["PARAM_NAME"] for r in param_rows],
 })
 ```
 
@@ -578,8 +593,8 @@ value_store.load_values({
 | 프롬프트 | 튜닝 포인트 |
 |---------|-------------|
 | `schema_linker.j2` | JSON 출력 안정성 — Few-shot 1~2개 추가 권장 |
-| `sql_gen.j2` | SQL 문법 오류 빈도 — Oracle 특유 문법(ROWNUM, DUAL) 강조 |
-| `sql_refiner.j2` | 에러 메시지 해석 — Oracle 에러 포맷 예시 추가 |
+| `sql_gen.j2` | SQL 문법 오류 빈도 — MySQL 8.0 문법(LIMIT, NOW(), CONCAT) 강조 |
+| `sql_refiner.j2` | 에러 메시지 해석 — MySQL 에러 포맷 예시 추가 |
 | `synthesizer.j2` | 인용 누락 — `[row_N]` 형식 강제 재강조 |
 
 **절차:**
@@ -588,21 +603,25 @@ value_store.load_values({
 3. `overall_score >= 이전 + 0.02` 확인 후 커밋
 4. Baseline 업데이트
 
-### 10-6. Oracle 마이그레이션 실행
+### 10-6. MySQL 마이그레이션 실행
 
 ```bash
-# App DB에 Phase 1 테이블 6개 생성
-sqlplus voc_app/비번@APPDB @db/migrations/001_initial.sql
+# App DB에 테이블 생성 (3개 migration 파일 순서대로)
+mysql -h 호스트 -u voc_app -p APPDB < db/migrations/001_initial.sql
+mysql -h 호스트 -u voc_app -p APPDB < db/migrations/002_review_flow.sql
+mysql -h 호스트 -u voc_app -p APPDB < db/migrations/003_knowledge.sql
 ```
 
 생성 확인:
 ```sql
-SELECT table_name FROM user_tables
-WHERE table_name IN (
-  'CHAT_SESSIONS','CHAT_MESSAGES','FEEDBACK_LOG',
-  'QUERY_LOG','CONFIG_VERSION','FEW_SHOT_BANK'
-);
--- 6행이 나와야 함
+SELECT TABLE_NAME FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'APPDB'
+  AND TABLE_NAME IN (
+    'chat_sessions','chat_messages','feedback_log',
+    'query_log','config_version','few_shot_bank',
+    'pending_reviews','knowledge_items'
+  );
+-- 8행이 나와야 함
 ```
 
 ### 10-7. 사내 LLM API 호환성 확인
@@ -696,7 +715,7 @@ hey -n 100 -c 5 -m POST -T "application/json" \
 - p50 / p95 / p99 응답시간
 - LLM 호출당 지연 (Schema → SQL → Refine → Interpret 평균 3~5회)
 - Cold start (첫 요청 vs 워밍업 후)
-- 동시 요청 시 Oracle pool 한계
+- 동시 요청 시 MySQL pool 한계 (max_size 기본 10)
 
 운영 SLA(예: p95 < 5초) 설정 근거.
 
@@ -712,12 +731,12 @@ hey -n 100 -c 5 -m POST -T "application/json" \
 
 ### Phase 1 사내 완료 체크리스트
 
-- [ ] `config/schema/tc_oracle.yaml` 실제 스키마 반영
+- [ ] `config/schema/tc_schema.yaml` 실제 TC MySQL DB 스키마 반영
 - [ ] `config/whitelist.yaml` 보안팀 승인 완료
 - [ ] ValueStore TC DB 값 로드 코드 추가
 - [ ] `config/few_shot/sql_seed.yaml` 실사용 패턴 10+개
 - [ ] 프롬프트 4개 사내 LLM으로 튜닝 완료
-- [ ] `db/migrations/001_initial.sql` 실행 완료
+- [ ] `db/migrations/001~003_*.sql` 실행 완료 (MySQL)
 - [ ] `app/infra/llm/internal_api.py` 사내 LLM 스펙에 맞게 조정
 - [ ] Golden Dataset 실사용자 질문으로 교체
 - [ ] `baseline_score` 실측 고정
@@ -731,7 +750,7 @@ hey -n 100 -c 5 -m POST -T "application/json" \
 
 ---
 
-## 11. DB 환경 (MySQL → 향후 Oracle 이전 가능)
+## 11. DB 환경 (MySQL 개발, 향후 Oracle 이전 가능)
 
 **현재 방침:** App DB / TC DB 모두 **MySQL 8.0 사용**. 시스템 규모가 커지면 Oracle로 이전. 지금은 MySQL에 집중하되, 나중에 갈아끼울 수 있도록 **얇은 추상화 레이어**만 유지.
 
@@ -742,27 +761,17 @@ App DB  (세션/메시지/feedback/few_shot 저장) : MySQL  ← 현재
 TC DB   (Text-to-SQL 대상, read-only)        : MySQL  ← 현재
 ```
 
-Phase 1 코드는 oracledb로 작성되어 있으므로 **MySQL 드라이버로 교체**가 필요합니다. 아래가 그 변경 지도입니다.
+**현재 코드는 MySQL로 완성되어 있습니다.** 이 섹션은 나중에 Oracle 이전 시 참고용입니다.
 
-### 11-2. 변경 파일 목록
+### 11-2. 현재 파일 구조
 
-| 파일 | 작업 | 우선순위 |
-|------|------|----------|
-| `app/infra/db/base.py` (신설) | `DBPool` ABC — 향후 Oracle 교체용 인터페이스 | 필수 |
-| `app/infra/db/mysql.py` (신설) | `MySQLPool` 구현 (aiomysql) | 필수 |
-| `app/infra/db/oracle.py` | 그대로 보존 — Oracle 이전 시 재활성화 | 그대로 |
-| `app/api/deps.py` | `OraclePool` → `MySQLPool` 교체 | 필수 |
-| `app/config.py` | DSN 포맷 변경 (host/port/db 분리) | 필수 |
-| `db/migrations/001_initial.sql` | MySQL 문법으로 재작성 | 필수 |
-| `.env.example` | MySQL 접속 정보로 교체 | 필수 |
-| `pyproject.toml` | `aiomysql>=0.2` 추가 | 필수 |
-| `app/core/agents/db/validator.py` | `dialect="mysql"` 기본값 | 필수 |
-| `config/prompts/sql_gen.j2` | MySQL SQL 규칙으로 교체 | 필수 |
-| `config/whitelist.yaml` | 그대로 (테이블/컬럼명은 동일) | 그대로 |
+| 파일 | 역할 |
+|------|------|
+| `app/infra/db/base.py` | `DBPool` ABC — Oracle 이전 시 구현체만 교체 |
+| `app/infra/db/mysql.py` | `MySQLPool` 구현 (aiomysql) — **현재 사용** |
+| `app/infra/db/oracle.py` | `OraclePool` 보존 — Oracle 이전 시 재활성화 |
 
-### 11-3. Oracle → MySQL 주요 변환표
-
-나중에 Oracle 이전 시 역방향으로 참고하세요.
+### 11-3. MySQL ↔ Oracle 주요 문법 차이 (Oracle 이전 시 참고)
 
 | 기능 | Oracle (기존) | MySQL (현재) |
 |------|--------------|-------------|
@@ -858,8 +867,7 @@ class MySQLPool(DBPool):
             raise DBExecutionError(str(e)) from e
 ```
 
-**파라미터 바인딩 주의:** MySQL은 `%(name)s` 또는 `%s`. Oracle의 `:name`과 다릅니다.
-기존 `sessions.py`에서 Oracle 스타일 `:param`이 있다면 `%(param)s`로 변환 필요.
+**파라미터 바인딩 주의:** MySQL은 `%(name)s` 또는 `%s`. (Oracle의 `:name`과 다름 — Oracle 이전 시 주의)
 
 `app/infra/db/oracle.py` — 그대로 보존. Oracle 이전 시 `MySQLPool` 자리에 재활성화.
 
@@ -907,13 +915,13 @@ tc_pool = MySQLPool(
 
 ```python
 # app/core/agents/db/validator.py
-def __init__(self, whitelist: dict, dialect: str = "mysql"):  # oracle → mysql
+def __init__(self, whitelist: dict, dialect: str = "mysql"):  # 현재 MySQL; Oracle 이전 시 "oracle"으로 변경
     self.dialect = dialect
 ```
 
 ### 11-8. 프롬프트 MySQL 규칙
 
-`config/prompts/sql_gen.j2` 상단 DB 소개 부분에서 Oracle 참조 제거:
+`config/prompts/sql_gen.j2` — MySQL 8.0 전용 규칙 (현재 상태):
 
 ```jinja2
 {# sql_gen.j2 — MySQL 8.0 대상 #}
@@ -926,7 +934,7 @@ def __init__(self, whitelist: dict, dialect: str = "mysql"):  # oracle → mysql
 
 ### 11-9. 마이그레이션 파일
 
-기존 `db/migrations/001_initial.sql` (Oracle용)을 MySQL 문법으로 교체:
+`db/migrations/001_initial.sql` — MySQL 8.0 문법 (현재 상태):
 
 ```sql
 -- db/migrations/001_initial.sql (MySQL 8.0)
@@ -1011,7 +1019,7 @@ LLM_API_BASE_URL=http://internal-llm-api/v1
 LLM_API_KEY=your-key-here
 LLM_MODEL=gpt-oss
 
-# Oracle App DB → MySQL App DB
+# MySQL App DB
 APP_DB_HOST=localhost
 APP_DB_PORT=3306
 APP_DB_NAME=APPDB
@@ -1124,13 +1132,11 @@ py -3 -m pytest tests/unit -v
 py -3 -m uvicorn app.main:app --reload
 ```
 
-### Oracle 마이그레이션
+### MySQL 마이그레이션
 ```bash
-# 초기 스키마
-sqlplus voc_app/비번@APPDB @db/migrations/001_initial.sql
-
-# Phase 3 추가 (미래)
-sqlplus voc_app/비번@APPDB @db/migrations/002_review_flow.sql
+mysql -h 호스트 -u voc_app -p APPDB < db/migrations/001_initial.sql
+mysql -h 호스트 -u voc_app -p APPDB < db/migrations/002_review_flow.sql
+mysql -h 호스트 -u voc_app -p APPDB < db/migrations/003_knowledge.sql
 ```
 
 ### Git 워크플로우 (Phase 2 시작)
@@ -1309,7 +1315,7 @@ class SplunkAgent(Agent):
 ### Phase 4: Knowledge Agent + Orchestrator + 품질 자동화
 
 **목표:**
-1. KnowledgeAgent — Oracle에 저장된 지식 항목으로 답변
+1. KnowledgeAgent — MySQL `knowledge_items` 테이블 지식 항목으로 답변
 2. Orchestrator — 질문 유형 자동 분류 → 적절한 Agent 선택
 3. Synthesizer — 복수 Agent 결과 통합
 4. Golden Eval CI — PR마다 회귀 자동 감지
@@ -1338,7 +1344,7 @@ class QueryPlanner:
 ```bash
 # 1. 클론 + 설치 (섹션 0 참고)
 # 2. .env 작성 (섹션 9 참고)
-# 3. Oracle 마이그레이션 실행
+# 3. MySQL 마이그레이션 실행 (섹션 12 참고)
 # 4. 유닛+통합 테스트 통과 확인
 pytest -m "not real_llm"   # 모두 green이어야 함
 ```
@@ -1398,9 +1404,8 @@ pytest -m real_llm tests/golden   # DB Phase 1 점수가 떨어지지 않아야 
 
 - **모든 LLM 호출에 trace_id 로깅** — `logger.bind(trace_id=context.trace_id)`
 - **외부 의존성은 `app/infra/`에만** — core는 인터페이스만 주입받음
-- **`app/infra/db/oracle.py`의 `execute()`** — INSERT/UPDATE용, `fetch_all()`은 SELECT 전용
+- **`DBPool.execute()`** — INSERT/UPDATE/DELETE용, `fetch_all()`은 SELECT 전용
 - **Pydantic v2** — `.dict()` 대신 `.model_dump()` 사용
-- **Oracle thin mode** — `oracledb.init_oracle_client()` 절대 호출 금지
 - **파일 인코딩 UTF-8** — Windows에서 YAML/Jinja2/Python 저장 시 반드시 UTF-8
 - **주석 최소화** — 이유가 명확하지 않은 WHY만 주석으로
 - **테스트 먼저** — TDD, 테스트 없는 PR 금지
@@ -1413,10 +1418,9 @@ pytest -m real_llm tests/golden   # DB Phase 1 점수가 떨어지지 않아야 
 
 | 에러 메시지 | 원인 | 해결 |
 |-------------|------|------|
-| `DPY-4011: the database or network closed the connection` | Oracle 연결 끊김 | pool 재시작, min/max 크기 확인 |
-| `DPY-6005: cannot connect to database` | DSN/계정/네트워크 문제 | `tnsping`으로 먼저 확인 |
-| `ORA-00942: table or view does not exist` | whitelist에 있지만 DB에 없음 | `config/whitelist.yaml`과 실제 DB 동기화 |
-| `ORA-00904: invalid identifier` | 컬럼명 오타 | LLM이 없는 컬럼 생성 → schema linker 프롬프트 개선 |
+| `Can't connect to MySQL server` | MySQL 호스트/포트/계정 문제 | `.env` 확인, `mysql -h 호스트 -u user -p` 직접 테스트 |
+| `Table 'APPDB.xxx' doesn't exist` | whitelist에 있지만 DB에 없음 | `config/whitelist.yaml`과 실제 DB 동기화 |
+| `Unknown column 'xxx'` | 컬럼명 오타 | LLM이 없는 컬럼 생성 → schema linker 프롬프트 개선 |
 | `LLMError: LLM이 유효한 JSON을 반환하지 않음` | `complete_json` 실패 | 프롬프트에 "반드시 JSON만" 강조, few-shot 추가 |
 | `UnicodeDecodeError: 'cp949'` | Windows 기본 인코딩 | `open(..., encoding='utf-8')` 명시 |
 | `ModuleNotFoundError: No module named 'app'` | 설치 안 됨 | `pip install -e ".[dev]"` |
@@ -1432,13 +1436,11 @@ pytest -m real_llm tests/golden   # DB Phase 1 점수가 떨어지지 않아야 
 3. `response_format={"type": "json_object"}` (지원하는 모델이면)
 4. 그래도 실패하면 regex로 `\{.*\}` 추출 후 재파싱
 
-### Oracle 연결이 너무 느릴 때
+### MySQL 연결 풀이 부족할 때
 
 ```python
-pool = await oracledb.create_pool_async(
-    ..., min=2, max=10, increment=1,
-    ping_interval=60,      # 60초마다 헬스체크
-)
+# app/api/deps.py — MySQLPool 생성 시 max_size 조정
+MySQLPool(host=..., max_size=20)  # 기본 10 → 동시 요청 많으면 늘리기
 ```
 
 ### Windows에서 LF/CRLF 경고
@@ -1453,10 +1455,10 @@ git config --global core.autocrlf input   # 리눅스 스타일로 통일
 
 | 실수 | 올바른 방법 |
 |------|-------------|
-| `oracledb.init_oracle_client()` 호출 | 삭제 (thin mode 자동) |
+| `aiomysql.connect()` 직접 호출 | `MySQLPool` 통해 연결 (풀 관리) |
 | `e.dict()` 사용 | `e.model_dump()` |
 | INSERT에 `fetch_all()` 사용 | `pool.execute()` 사용 |
-| `RETURNING INTO :var` + `fetch_all` | `execute()` 후 `SELECT MAX(id)` 별도 호출 |
+| INSERT 후 ID 조회 | `execute()` 후 `SELECT LAST_INSERT_ID()` 별도 호출 |
 | `assert answer == "정확한 텍스트"` | `assert "키워드" in answer` |
 | 프롬프트 수정 후 바로 머지 | Golden Eval 통과 후 머지 |
 | `config/whitelist.yaml` DB에 저장 | YAML 파일로만 관리 (보안) |
