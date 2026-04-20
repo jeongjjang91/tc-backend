@@ -23,6 +23,7 @@ from app.core.agents.knowledge.agent import KnowledgeAgent
 from app.infra.db.knowledge_repo import KnowledgeRepository
 from app.core.orchestrator.planner import QueryPlanner
 from app.core.orchestrator.executor import QueryExecutor
+from app.infra.db.table_service import TableService
 
 _db_agent: DBAgent | None = None
 _rag_agent: RAGAgent | None = None
@@ -31,6 +32,7 @@ _session_repo: SessionRepository | None = None
 _review_repo: ReviewRepository | None = None
 _planner: QueryPlanner | None = None
 _executor: QueryExecutor | None = None
+_table_service: TableService | None = None
 
 
 async def get_db_agent() -> DBAgent:
@@ -61,8 +63,12 @@ async def get_executor() -> QueryExecutor:
     return _executor
 
 
+async def get_table_service() -> TableService:
+    return _table_service
+
+
 async def init_dependencies() -> None:
-    global _db_agent, _rag_agent, _splunk_agent, _session_repo, _review_repo, _planner, _executor
+    global _db_agent, _rag_agent, _splunk_agent, _session_repo, _review_repo, _planner, _executor, _table_service
     s = get_settings()
     loader = ConfigLoader(s.config_dir)
     thresholds = loader.load_thresholds()
@@ -145,6 +151,8 @@ async def init_dependencies() -> None:
         knowledge_repo=knowledge_repo,
         top_k=thresholds.get("knowledge_top_k", 5),
     )
+
+    _table_service = TableService(tc_pool=tc_pool, whitelist=whitelist)
 
     _planner = QueryPlanner(llm=llm, renderer=renderer)
     _executor = QueryExecutor(

@@ -1,12 +1,27 @@
 tables:
   PARAMETER:
     columns: [param_id, param_name, eqp_id, created_at]
+    filterable: [eqp_id, param_name]
     requires_where_clause: true
   MODEL_INFO:
     columns: [eqp_id, model_name, version, created_at]
+    filterable: [eqp_id, model_name]
     requires_where_clause: false
   DCOL_ITEM:
     columns: [item_id, item_name, eqp_id, dev_status, created_at]
+    filterable: [eqp_id, dev_status]
+    requires_where_clause: true
+  TC_EQUIPMENT:
+    columns: [LINEID, EQPID, SERVER_MODEL, DCOP_MODEL, JAR_NAME]
+    filterable: [LINEID, EQPID, SERVER_MODEL, DCOP_MODEL]
+    requires_where_clause: false
+  TC_EQP_PARAM:
+    columns: [LINEID, EQPID, SERVER_MODEL, PARAM_NAME, PARAM_VALUE]
+    filterable: [LINEID, EQPID, SERVER_MODEL, PARAM_NAME]
+    requires_where_clause: true
+  TC_EQP_RELINK:
+    columns: [EQP_ID, CEID, RPTID, RPT_ORDER, VID_LIST]
+    filterable: [EQP_ID, CEID, RPTID]
     requires_where_clause: true
 large_tables: [DCOL_LOG, EVENT_HISTORY]
 forbidden_functions: ["DBMS_", "UTL_", "EXEC"]
