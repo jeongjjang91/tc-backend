@@ -36,12 +36,22 @@
 | T5 | `tc_schema.yaml` description 품질 개선 가이드라인 + 검증 스크립트 | 신규 | 1h |
 | T6 | `sql_gen.j2` Chain-of-Thought + MySQL 문법 강화 | 수정 | 1h |
 | T7 | Golden Eval 실행 + baseline 고정 | 실행 | 30m |
+| T8 | Self-Consistency (다수결 SQL 선택) | 신규 | 2h |
+| T9 | Execution-Guided Verification (결과 계약 검증) | 신규 | 2h |
+| T10 | 시맨틱 평가 지표 (EX / Component Match / Valid SQL) | 신규 | 2h |
+| T11 | Schema Linker 2단계 (TF-IDF → LLM 재랭킹) | 수정 | 2h |
+| T12 | Query Log 기반 프롬프트 캐싱 | 신규 | 1.5h |
+| T13 | Fuzzy Value Matching (rapidfuzz) | 신규 | 1h |
+| T14 | Anti-pattern Few-shot YAML | 수정 | 1h |
+| T15 | Active Learning Loop (저신뢰 케이스 큐) | 신규 | 2h |
+| T16 | Multi-model Ensemble (GPT-OSS + Gemma4) | 신규 | 2h |
+| T17 | SQL AST 정적 수정 (sqlglot) | 신규 | 1.5h |
 
 ### 이번에 구현하지 않는 것
 
-- Few-shot 유사 검색 개선 (T1~T7 완료 후 별도 스펙)
 - Splunk 이상 탐지 (별도 스펙)
 - 신뢰도 캘리브레이션 (운영 데이터 쌓인 후)
+- T8~T17은 T1~T7 완료 후 순서대로 구현 (기반 인프라가 먼저 필요)
 
 ---
 
@@ -1062,7 +1072,788 @@ py -m pytest -m real_llm tests/golden -v -s
 
 ---
 
+## 9-2. T8~T17 고급 최적화 — 상세 구현 가이드
+
+> **전제:** T1~T7 완료 후 진행. 각 태스크는 독립적으로 구현 가능하지만 T10은 T1 DB 인프라에 의존.
+
+---
+
+### T8. Self-Consistency (다수결 SQL 선택)
+
+**목적:** 같은 질문에 대해 N개의 SQL을 생성하고 실행 결과가 동일한 SQL을 선택 → 비결정적 LLM의 오류를 평균화.
+
+**배경:** LLM은 같은 입력에 다른 SQL을 생성할 수 있음. 3개 중 2개가 같은 결과를 반환하면 그 결과가 맞을 가능성이 높음.
+
+**구현 위치:** `app/core/agents/db/agent.py` → `_generate_sql()` 메서드 확장
+
+```python
+# app/core/agents/db/agent.py
+
+import asyncio
+from collections import Counter
+from typing import Optional
+
+async def _generate_with_consistency(
+    self,
+    question: str,
+    schema_context: str,
+    n_samples: int = 3,
+    temperature: float = 0.3,
+) -> tuple[str, float]:
+    """N개 SQL 생성 후 실행 결과 기준 다수결 선택.
+    Returns: (best_sql, confidence)  confidence = 최다 득표수 / n_samples
+    """
+    candidates: list[tuple[str, int]] = []  # (sql, result_hash)
+
+    async def _sample():
+        sql = await self.sql_generator.generate(
+            question, schema_context, temperature=temperature
+        )
+        try:
+            rows = await self.tc_pool.fetch_all(sql, max_rows=200)
+            # 결과 집합을 정렬 후 해시 (순서 무관 비교)
+            result_hash = hash(tuple(sorted(str(r) for r in rows)))
+            return sql, result_hash
+        except Exception:
+            return None
+
+    results = await asyncio.gather(*[_sample() for _ in range(n_samples)])
+    valid = [r for r in results if r is not None]
+
+    if not valid:
+        # 모두 실패 → 단일 샘플로 폴백
+        return await self.sql_generator.generate(question, schema_context), 0.0
+
+    # 결과 해시 기준 다수결
+    hash_counts = Counter(result_hash for _, result_hash in valid)
+    best_hash, best_count = hash_counts.most_common(1)[0]
+    best_sql = next(sql for sql, h in valid if h == best_hash)
+    confidence = best_count / n_samples
+    return best_sql, confidence
+```
+
+**설정 추가:** `config/agents.yaml`
+```yaml
+db_agent:
+  self_consistency:
+    enabled: true
+    n_samples: 3          # 운영 비용 고려: 3이 기본
+    temperature: 0.3      # 약간의 다양성 허용
+    min_confidence: 0.5   # confidence < 0.5면 검토 큐에 등록
+```
+
+**테스트:** `tests/unit/test_self_consistency.py`
+```python
+@pytest.mark.asyncio
+async def test_majority_vote_picks_most_common_result():
+    # 3개 중 2개가 같은 결과 → 2개짜리 선택
+    ...
+```
+
+---
+
+### T9. Execution-Guided Verification (결과 계약 검증)
+
+**목적:** SQL 실행 결과가 "의미 있는 결과"인지 계약으로 검증. 빈 결과, 전체 스캔, 비정상 카디널리티를 탐지.
+
+**구현 위치:** `app/core/agents/db/verification.py` (신규 파일)
+
+```python
+# app/core/agents/db/verification.py
+
+from dataclasses import dataclass
+from typing import Any
+
+LARGE_TABLES = {"TC_EQP_PARAM", "TC_EQP_RELINK"}  # WHERE 필수 테이블
+
+@dataclass
+class VerificationResult:
+    passed: bool
+    checks: dict[str, bool]
+    warnings: list[str]
+
+def verify_execution_result(
+    sql: str,
+    rows: list[dict[str, Any]],
+    question: str,
+) -> VerificationResult:
+    sql_upper = sql.upper()
+    checks = {}
+    warnings = []
+
+    # 1. 결과 비어있지 않음
+    checks["non_empty"] = len(rows) > 0
+    if not checks["non_empty"]:
+        warnings.append("결과가 비어 있음 — 필터 조건이 너무 좁거나 데이터 없음")
+
+    # 2. 카디널리티 합리적 (1 ~ 10,000행)
+    checks["cardinality_reasonable"] = 1 <= len(rows) <= 10_000
+    if len(rows) > 10_000:
+        warnings.append(f"결과가 {len(rows)}행 — LIMIT 또는 WHERE 조건 부족 가능성")
+
+    # 3. 대형 테이블 전체 스캔 방지
+    needs_where = any(t in sql_upper for t in LARGE_TABLES)
+    checks["no_full_scan"] = not needs_where or "WHERE" in sql_upper
+    if not checks["no_full_scan"]:
+        warnings.append("대형 테이블 전체 스캔 감지 — WHERE 조건 없음")
+
+    # 4. SELECT * 방지
+    checks["no_select_star"] = "SELECT *" not in sql_upper
+    if not checks["no_select_star"]:
+        warnings.append("SELECT * 사용 — 명시적 컬럼 지정 권장")
+
+    passed = all(checks.values())
+    return VerificationResult(passed=passed, checks=checks, warnings=warnings)
+```
+
+**Agent 연동:** `app/core/agents/db/agent.py`의 실행 단계 이후:
+```python
+verification = verify_execution_result(sql, rows, question)
+if not verification.passed:
+    # 검증 실패 → refine_loop에 힌트 전달
+    hint = "; ".join(verification.warnings)
+    sql = await self._refine_sql(sql, hint)
+```
+
+**테스트:** `tests/unit/test_verification.py`
+```python
+def test_empty_result_fails():
+    result = verify_execution_result("SELECT ...", [], "...")
+    assert not result.passed
+    assert not result.checks["non_empty"]
+
+def test_large_table_no_where_fails():
+    result = verify_execution_result(
+        "SELECT EQPID FROM TC_EQP_PARAM", [{"EQPID": "A"}], "..."
+    )
+    assert not result.checks["no_full_scan"]
+```
+
+---
+
+### T10. 시맨틱 평가 지표 (Execution Accuracy / Component Match / Valid SQL Rate)
+
+**목적:** 현재 Golden Eval은 키워드 매칭만 사용. Spider/BIRD 벤치마크 수준의 정밀 지표 추가.
+
+#### 10-1. Golden YAML에 `expected_sql` 필드 추가
+
+```yaml
+# tests/golden/datasets/db_phase1.yaml — 케이스 예시 (수정)
+cases:
+  - id: db_001
+    question: "L01 라인에서 최근 교체된 설비는?"
+    expected_keywords: ["LINEID", "L01"]
+    expected_sql: >-
+      SELECT EQPID, REPLACE_DATE
+      FROM TC_EQUIPMENT
+      WHERE LINEID = 'L01'
+      ORDER BY REPLACE_DATE DESC
+      LIMIT 10
+    difficulty: medium
+```
+
+> `expected_sql`은 선택 필드. 없으면 기존 키워드 매칭만 사용. 있으면 EX / Component Match 추가 계산.
+
+#### 10-2. `tests/golden/metrics.py` 확장
+
+```python
+# tests/golden/metrics.py (수정)
+
+import sqlglot
+from typing import Any
+
+async def execution_accuracy(
+    actual_sql: str,
+    expected_sql: str,
+    tc_pool,
+    max_rows: int = 500,
+) -> float:
+    """실행 결과 집합 동치 비교. 0.0 또는 1.0."""
+    try:
+        actual_rows = await tc_pool.fetch_all(actual_sql, max_rows=max_rows)
+        expected_rows = await tc_pool.fetch_all(expected_sql, max_rows=max_rows)
+        actual_set = frozenset(tuple(sorted(r.items())) for r in actual_rows)
+        expected_set = frozenset(tuple(sorted(r.items())) for r in expected_rows)
+        return 1.0 if actual_set == expected_set else 0.0
+    except Exception:
+        return 0.0
+
+
+def component_match(actual_sql: str, expected_sql: str) -> dict[str, bool]:
+    """SELECT / FROM / WHERE 절 개별 일치 여부."""
+    def _extract(sql: str, clause: str) -> set[str]:
+        try:
+            ast = sqlglot.parse_one(sql, dialect="mysql")
+            node = ast.find(getattr(sqlglot.expressions, clause, None))
+            return {str(c).upper() for c in (node.expressions if node else [])}
+        except Exception:
+            return set()
+
+    return {
+        "select_match": _extract(actual_sql, "Select") == _extract(expected_sql, "Select"),
+        "from_match": _extract(actual_sql, "From") == _extract(expected_sql, "From"),
+        "where_match": _extract(actual_sql, "Where") == _extract(expected_sql, "Where"),
+    }
+
+
+def valid_sql_rate(sql_list: list[str]) -> float:
+    """파싱 가능한 SQL 비율 (문법 오류 없음)."""
+    valid = 0
+    for sql in sql_list:
+        try:
+            sqlglot.parse_one(sql, dialect="mysql")
+            valid += 1
+        except Exception:
+            pass
+    return valid / len(sql_list) if sql_list else 0.0
+```
+
+#### 10-3. `eval_case` 테이블 컬럼 추가 (DDL 수정)
+
+```sql
+-- db/migrations/005_eval_metrics.sql
+ALTER TABLE eval_case
+  ADD COLUMN execution_accuracy DECIMAL(5,4) AFTER score,
+  ADD COLUMN select_match       TINYINT(1)   AFTER execution_accuracy,
+  ADD COLUMN from_match         TINYINT(1)   AFTER select_match,
+  ADD COLUMN where_match        TINYINT(1)   AFTER from_match;
+```
+
+**의존성 추가:** `requirements.txt`
+```
+sqlglot>=23.0.0
+```
+
+---
+
+### T11. Schema Linker 2단계 (TF-IDF → LLM 재랭킹)
+
+**목적:** 현재 Schema Linker는 TF-IDF만 사용. 의미적으로 유사하지만 키워드가 다른 컬럼을 놓침. LLM이 후보 10개 중 실제 필요한 것을 선택하게 함.
+
+**구현 위치:** `app/core/agents/db/schema_linker.py` (수정)
+
+```python
+# app/core/agents/db/schema_linker.py (수정)
+
+class SchemaLinker:
+    def __init__(self, schema_store, llm_provider, whitelist):
+        self.schema_store = schema_store
+        self.llm = llm_provider
+        self.whitelist = whitelist
+
+    async def link(self, question: str) -> list[str]:
+        # Stage 1: TF-IDF로 후보 10개 추출
+        candidates = self.schema_store.search(question, top_k=10)
+
+        # Stage 2: LLM이 실제 필요한 테이블/컬럼 선택
+        prompt = self._build_rerank_prompt(question, candidates)
+        selected = await self.llm.complete_json(prompt)
+        return selected.get("relevant_columns", candidates[:5])
+
+    def _build_rerank_prompt(self, question: str, candidates: list[str]) -> str:
+        return (
+            f"질문: {question}\n\n"
+            f"후보 테이블/컬럼:\n" + "\n".join(f"- {c}" for c in candidates) +
+            "\n\n위 후보 중 이 질문에 필요한 것만 JSON 배열로 반환하세요."
+            '\n{"relevant_columns": ["TABLE.COLUMN", ...]}'
+        )
+```
+
+**프롬프트 분리:** `config/prompts/schema_rerank.j2`
+```jinja2
+질문: {{ question }}
+
+후보 스키마:
+{% for col in candidates %}
+- {{ col }}
+{% endfor %}
+
+이 질문을 SQL로 변환하기 위해 실제 필요한 테이블/컬럼만 골라서 JSON으로 반환하세요.
+{"relevant_columns": ["테이블명.컬럼명", ...]}
+```
+
+**테스트:** `tests/unit/test_schema_linker_rerank.py`
+```python
+@pytest.mark.asyncio
+async def test_rerank_removes_irrelevant_candidates():
+    mock_llm = AsyncMock()
+    mock_llm.complete_json.return_value = {
+        "relevant_columns": ["TC_EQUIPMENT.EQPID", "TC_EQUIPMENT.LINEID"]
+    }
+    linker = SchemaLinker(schema_store=..., llm_provider=mock_llm, whitelist=...)
+    result = await linker.link("L01 라인 설비 목록")
+    assert "TC_EQUIPMENT.EQPID" in result
+    assert len(result) <= 5  # 불필요한 컬럼 제거됨
+```
+
+---
+
+### T12. Query Log 기반 프롬프트 캐싱
+
+**목적:** 동일한 질문(또는 매우 유사한 질문)에 대해 이전에 성공한 SQL을 재사용. LLM 호출 비용 절감 + 응답 속도 향상.
+
+**구현 위치:** `app/infra/db/query_log.py` (기존 파일 수정) + `app/core/agents/db/agent.py`
+
+```python
+# app/infra/db/query_log.py (수정)
+
+import hashlib
+from datetime import datetime, timedelta
+
+class QueryLogRepository:
+    # ... 기존 코드 ...
+
+    async def get_cached_sql(
+        self,
+        question: str,
+        ttl_hours: int = 24,
+    ) -> str | None:
+        """question_hash로 최근 성공 SQL 조회. TTL 내에만 반환."""
+        question_hash = hashlib.sha256(question.encode()).hexdigest()
+        row = await self.pool.fetch_one(
+            """
+            SELECT sql_text FROM query_log
+            WHERE question_hash = %s
+              AND success = 1
+              AND created_at > %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            question_hash,
+            datetime.now() - timedelta(hours=ttl_hours),
+        )
+        return row["sql_text"] if row else None
+
+    async def save_success(self, question: str, sql: str) -> None:
+        question_hash = hashlib.sha256(question.encode()).hexdigest()
+        await self.pool.execute(
+            """
+            INSERT INTO query_log (question_hash, question_text, sql_text, success)
+            VALUES (%s, %s, %s, 1)
+            ON DUPLICATE KEY UPDATE sql_text = %s, created_at = CURRENT_TIMESTAMP
+            """,
+            question_hash, question, sql, sql,
+        )
+```
+
+**DDL 추가:** `db/migrations/006_query_log_cache.sql`
+```sql
+ALTER TABLE query_log
+  ADD COLUMN question_hash CHAR(64) AFTER question_text,
+  ADD INDEX idx_query_log_hash (question_hash, success, created_at);
+```
+
+**Agent 연동:**
+```python
+# app/core/agents/db/agent.py — run() 메서드 시작 부분
+
+cached_sql = await self.query_log.get_cached_sql(question, ttl_hours=24)
+if cached_sql:
+    rows = await self.tc_pool.fetch_all(cached_sql, max_rows=500)
+    return self._format_result(rows, from_cache=True)
+```
+
+---
+
+### T13. Fuzzy Value Matching (rapidfuzz)
+
+**목적:** 사용자가 설비명을 오타/축약으로 입력했을 때 가장 유사한 실제 값으로 매칭. ValueStore와 연동.
+
+**의존성:** `requirements.txt`에 `rapidfuzz>=3.0.0` 추가
+
+**구현 위치:** `app/core/agents/db/value_matcher.py` (신규 파일)
+
+```python
+# app/core/agents/db/value_matcher.py
+
+from rapidfuzz import process, fuzz
+from typing import Any
+
+class ValueMatcher:
+    """ValueStore의 실제 값과 사용자 입력을 Fuzzy 매칭."""
+
+    def __init__(self, value_store, threshold: int = 80):
+        self.value_store = value_store
+        self.threshold = threshold
+
+    def find_best(self, user_input: str, column: str) -> str | None:
+        """column 값 목록에서 user_input과 가장 유사한 값 반환.
+        threshold 미만이면 None 반환 (매칭 실패).
+        """
+        known_values = self.value_store.get_values(column)
+        if not known_values:
+            return None
+
+        match, score, _ = process.extractOne(
+            user_input,
+            known_values,
+            scorer=fuzz.WRatio,  # 부분 문자열 + 전치 오류에 강함
+        )
+        return match if score >= self.threshold else None
+
+    def enrich_filters(self, filters: dict[str, str]) -> dict[str, str]:
+        """필터 딕셔너리의 모든 값에 Fuzzy 매칭 적용.
+        매칭 성공 시 교체, 실패 시 원본 유지.
+        """
+        enriched = {}
+        for col, val in filters.items():
+            best = self.find_best(val, col)
+            enriched[col] = best if best else val
+        return enriched
+```
+
+**Agent 연동:** `app/core/agents/db/agent.py`
+```python
+# run() 메서드에서 schema_link 이후
+enriched_filters = self.value_matcher.enrich_filters(extracted_filters)
+```
+
+**테스트:** `tests/unit/test_value_matcher.py`
+```python
+def test_fuzzy_match_typo():
+    store = MagicMock()
+    store.get_values.return_value = ["EQPA-001", "EQPB-002", "EQPC-003"]
+    matcher = ValueMatcher(store, threshold=80)
+    assert matcher.find_best("EQPA001", "EQPID") == "EQPA-001"  # 하이픈 누락
+
+def test_fuzzy_match_below_threshold_returns_none():
+    store = MagicMock()
+    store.get_values.return_value = ["EQPA-001", "EQPB-002"]
+    matcher = ValueMatcher(store, threshold=80)
+    assert matcher.find_best("XXXXXXXXX", "EQPID") is None
+```
+
+---
+
+### T14. Anti-pattern Few-shot YAML
+
+**목적:** LLM에게 "이렇게 하면 안 된다"는 예시를 제공. 특히 전체 스캔, SELECT * 등의 나쁜 패턴을 피하도록 유도.
+
+**파일 위치:** `config/few_shot/sql_antipatterns.yaml` (신규 파일)
+
+```yaml
+# config/few_shot/sql_antipatterns.yaml
+# LLM 프롬프트에 주입되는 Anti-pattern 예시
+# 형식: bad_question + bad_sql + correction + good_sql
+
+antipatterns:
+  - id: ap_001
+    bad_question: "TC_EQP_PARAM 테이블의 모든 데이터 보여줘"
+    bad_sql: "SELECT * FROM TC_EQP_PARAM"
+    correction: |
+      TC_EQP_PARAM은 대형 테이블 (수백만 행). WHERE 조건과 LIMIT 없이 조회하면
+      DB 과부하. 화이트리스트에서 필요한 컬럼만 명시적으로 선택해야 함.
+    good_sql: |
+      SELECT EQPID, PARAM_NAME, PARAM_VALUE
+      FROM TC_EQP_PARAM
+      WHERE LINEID = 'L01' AND EQPID = 'EQP-A001'
+      LIMIT 100
+
+  - id: ap_002
+    bad_question: "모든 설비 목록"
+    bad_sql: "SELECT * FROM TC_EQUIPMENT"
+    correction: |
+      WHERE 없는 전체 조회는 운영 DB에 부하. 라인/타입 등 필터 유도 또는
+      LIMIT 명시. SELECT *는 불필요한 컬럼 포함.
+    good_sql: |
+      SELECT EQPID, SERVER_MODEL, LINEID
+      FROM TC_EQUIPMENT
+      WHERE LINEID = 'L01'
+      ORDER BY EQPID
+      LIMIT 50
+
+  - id: ap_003
+    bad_question: "EQPID가 EQP로 시작하는 거 다 줘"
+    bad_sql: "SELECT * FROM TC_EQUIPMENT WHERE EQPID LIKE 'EQP%'"
+    correction: |
+      LIKE 'prefix%'는 인덱스 사용 가능하나 결과가 많을 수 있음.
+      LIMIT 추가 필수. SELECT * 대신 필요 컬럼만.
+    good_sql: |
+      SELECT EQPID, SERVER_MODEL
+      FROM TC_EQUIPMENT
+      WHERE EQPID LIKE 'EQP%'
+      ORDER BY EQPID
+      LIMIT 100
+
+  - id: ap_004
+    bad_question: "TC_EQP_RELINK에서 CEID 뭐뭐 있어?"
+    bad_sql: "SELECT DISTINCT CEID FROM TC_EQP_RELINK"
+    correction: |
+      TC_EQP_RELINK는 대형 테이블. DISTINCT + 전체 스캔은 느림.
+      특정 EQP_ID 범위로 한정해야 함.
+    good_sql: |
+      SELECT DISTINCT CEID
+      FROM TC_EQP_RELINK
+      WHERE EQP_ID = 'EQP-A001'
+      LIMIT 50
+```
+
+**프롬프트 연동:** `config/prompts/sql_gen.j2`에 anti-pattern 섹션 추가
+```jinja2
+{# sql_gen.j2 — anti-pattern 섹션 추가 #}
+{% if antipatterns %}
+## 절대 피해야 할 패턴
+
+{% for ap in antipatterns %}
+❌ 나쁜 예 ({{ ap.id }}):
+```sql
+{{ ap.bad_sql }}
+```
+이유: {{ ap.correction }}
+
+✅ 올바른 예:
+```sql
+{{ ap.good_sql }}
+```
+{% endfor %}
+{% endif %}
+```
+
+---
+
+### T15. Active Learning Loop (저신뢰 케이스 큐)
+
+**목적:** 신뢰도가 낮은 응답을 자동으로 검토 큐에 등록. 검토자 피드백을 Few-shot에 추가하여 모델 품질 향상.
+
+**구현 흐름:**
+```
+Agent 실행 → confidence 계산 → [0.6, 0.8) 구간 → active_learning_queue 테이블 INSERT
+→ 검토자 UI에서 승인/수정 → 승인된 케이스 → few_shot_example 테이블 INSERT
+```
+
+**DDL:** `db/migrations/007_active_learning.sql`
+```sql
+CREATE TABLE active_learning_queue (
+  queue_id      BIGINT AUTO_INCREMENT PRIMARY KEY,
+  session_id    VARCHAR(36)   NOT NULL,
+  question      TEXT          NOT NULL,
+  generated_sql TEXT,
+  confidence    DECIMAL(5,4)  NOT NULL,
+  status        ENUM('pending', 'approved', 'rejected', 'modified') DEFAULT 'pending',
+  reviewer_sql  TEXT,                          -- 검토자가 수정한 SQL
+  reviewed_by   VARCHAR(100),
+  reviewed_at   TIMESTAMP,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_alq_status (status, confidence),
+  INDEX idx_alq_session (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+**구현 위치:** `app/infra/db/active_learning_repo.py` (신규)
+```python
+# app/infra/db/active_learning_repo.py
+
+CONFIDENCE_LOW = 0.6
+CONFIDENCE_HIGH = 0.8
+
+class ActiveLearningRepository:
+    def __init__(self, pool):
+        self.pool = pool
+
+    async def maybe_enqueue(
+        self, session_id: str, question: str, sql: str, confidence: float
+    ) -> bool:
+        """신뢰도가 [LOW, HIGH) 구간이면 큐에 등록. 등록 여부 반환."""
+        if not (CONFIDENCE_LOW <= confidence < CONFIDENCE_HIGH):
+            return False
+        await self.pool.execute(
+            """
+            INSERT INTO active_learning_queue
+              (session_id, question, generated_sql, confidence)
+            VALUES (%s, %s, %s, %s)
+            """,
+            session_id, question, sql, confidence,
+        )
+        return True
+
+    async def approve_and_promote(self, queue_id: int, reviewer: str) -> None:
+        """승인 → few_shot_example 테이블에 자동 추가."""
+        row = await self.pool.fetch_one(
+            "SELECT * FROM active_learning_queue WHERE queue_id = %s", queue_id
+        )
+        final_sql = row["reviewer_sql"] or row["generated_sql"]
+
+        await self.pool.execute(
+            """
+            INSERT INTO few_shot_example (question, sql_text, source)
+            VALUES (%s, %s, 'active_learning')
+            """,
+            row["question"], final_sql,
+        )
+        await self.pool.execute(
+            """
+            UPDATE active_learning_queue
+            SET status='approved', reviewed_by=%s, reviewed_at=CURRENT_TIMESTAMP
+            WHERE queue_id=%s
+            """,
+            reviewer, queue_id,
+        )
+```
+
+---
+
+### T16. Multi-model Ensemble (GPT-OSS + Gemma4)
+
+**목적:** 두 모델을 동시에 호출하여 결과를 비교. 불일치 시 검토 큐 등록. 일치 시 신뢰도 향상.
+
+**구현 위치:** `app/infra/llm/ensemble.py` (신규)
+```python
+# app/infra/llm/ensemble.py
+
+import asyncio
+from app.infra.llm.base import LLMProvider
+
+class EnsembleLLM:
+    """두 LLM 동시 호출 → 결과 비교."""
+
+    def __init__(self, primary: LLMProvider, secondary: LLMProvider):
+        self.primary = primary
+        self.secondary = secondary
+
+    async def complete_sql(self, prompt: str) -> tuple[str, float]:
+        """Returns: (best_sql, agreement_score)"""
+        primary_sql, secondary_sql = await asyncio.gather(
+            self.primary.complete(prompt),
+            self.secondary.complete(prompt),
+        )
+
+        # 실행 결과 비교로 일치 여부 판단 (T8 hash 비교 활용)
+        agreement = await self._execution_agreement(primary_sql, secondary_sql)
+
+        if agreement >= 0.9:
+            return primary_sql, agreement  # 높은 신뢰도
+        else:
+            # 불일치 → primary 반환하되 낮은 신뢰도
+            return primary_sql, agreement
+
+    async def _execution_agreement(self, sql1: str, sql2: str) -> float:
+        """두 SQL 실행 결과 유사도 0.0~1.0."""
+        try:
+            rows1 = await self.tc_pool.fetch_all(sql1, max_rows=100)
+            rows2 = await self.tc_pool.fetch_all(sql2, max_rows=100)
+            set1 = frozenset(tuple(sorted(r.items())) for r in rows1)
+            set2 = frozenset(tuple(sorted(r.items())) for r in rows2)
+            if not set1 and not set2:
+                return 1.0
+            return len(set1 & set2) / len(set1 | set2) if set1 | set2 else 0.0
+        except Exception:
+            return 0.0
+```
+
+**설정:** `config/agents.yaml`
+```yaml
+db_agent:
+  ensemble:
+    enabled: false          # 비용 2배 → 기본 비활성화
+    primary_model: gpt-oss
+    secondary_model: gemma4
+    min_agreement: 0.8      # 이 이하면 active_learning_queue 등록
+```
+
+---
+
+### T17. SQL AST 정적 수정 (sqlglot)
+
+**목적:** LLM이 생성한 SQL에 문법 오류나 방언(Oracle/MSSQL 문법 혼용)이 있을 때 LLM 재호출 없이 정적으로 수정.
+
+**구현 위치:** `app/core/agents/db/ast_repair.py` (신규)
+```python
+# app/core/agents/db/ast_repair.py
+
+import sqlglot
+from sqlglot import expressions as exp
+
+class SQLASTRepair:
+    """sqlglot로 SQL 정적 분석 + 자동 수정."""
+
+    TARGET_DIALECT = "mysql"
+
+    def repair(self, sql: str) -> tuple[str, list[str]]:
+        """Returns: (repaired_sql, applied_fixes)"""
+        fixes = []
+        try:
+            ast = sqlglot.parse_one(sql, error_level=sqlglot.ErrorLevel.WARN)
+        except Exception as e:
+            # 파싱 불가 → 원본 반환
+            return sql, [f"파싱 실패: {e}"]
+
+        # Fix 1: Oracle ROWNUM → MySQL LIMIT
+        if "ROWNUM" in sql.upper():
+            sql = self._replace_rownum(sql)
+            fixes.append("ROWNUM → LIMIT 변환")
+
+        # Fix 2: Oracle NVL → MySQL IFNULL
+        if "NVL(" in sql.upper():
+            sql = sql.replace("NVL(", "IFNULL(").replace("nvl(", "IFNULL(")
+            fixes.append("NVL → IFNULL 변환")
+
+        # Fix 3: 방언 통일 (Oracle/MSSQL → MySQL)
+        try:
+            repaired = sqlglot.transpile(sql, read="oracle", write="mysql")[0]
+            if repaired != sql:
+                fixes.append("Oracle → MySQL 방언 변환")
+                sql = repaired
+        except Exception:
+            pass
+
+        # Fix 4: LIMIT 없는 대형 테이블 쿼리에 LIMIT 추가
+        sql, limit_added = self._ensure_limit(sql)
+        if limit_added:
+            fixes.append("LIMIT 자동 주입")
+
+        return sql, fixes
+
+    def _replace_rownum(self, sql: str) -> str:
+        # ROWNUM <= N → LIMIT N
+        import re
+        return re.sub(
+            r"WHERE\s+ROWNUM\s*<=\s*(\d+)",
+            r"LIMIT \1",
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    def _ensure_limit(self, sql: str, default_limit: int = 1000) -> tuple[str, bool]:
+        if "LIMIT" in sql.upper():
+            return sql, False
+        return sql.rstrip(";") + f" LIMIT {default_limit}", True
+```
+
+**Agent 연동:** `app/core/agents/db/agent.py`
+```python
+# SQL 생성 직후, 실행 전
+repaired_sql, fixes = self.ast_repair.repair(generated_sql)
+if fixes:
+    logger.info(f"AST 수정 적용: {fixes}")
+generated_sql = repaired_sql
+```
+
+**테스트:** `tests/unit/test_ast_repair.py`
+```python
+def test_rownum_to_limit():
+    repair = SQLASTRepair()
+    sql, fixes = repair.repair("SELECT * FROM TC_EQUIPMENT WHERE ROWNUM <= 10")
+    assert "LIMIT 10" in sql
+    assert "ROWNUM → LIMIT 변환" in fixes
+
+def test_nvl_to_ifnull():
+    repair = SQLASTRepair()
+    sql, fixes = repair.repair("SELECT NVL(EQPID, 'N/A') FROM TC_EQUIPMENT")
+    assert "IFNULL" in sql
+    assert "NVL → IFNULL 변환" in fixes
+
+def test_limit_auto_injection():
+    repair = SQLASTRepair()
+    sql, fixes = repair.repair("SELECT EQPID FROM TC_EQUIPMENT WHERE LINEID='L01'")
+    assert "LIMIT" in sql
+    assert "LIMIT 자동 주입" in fixes
+```
+
+---
+
 ## 10. 파일 변경 요약
+
+### T1~T7 (기초 인프라)
 
 | 파일 | 변경 유형 | 태스크 |
 |------|----------|--------|
@@ -1080,6 +1871,32 @@ py -m pytest -m real_llm tests/golden -v -s
 | `app/core/agents/db/sql_generator.py` | 수정 (allowed_tables 주입) | T6 |
 | `tests/golden/datasets/db_phase1.yaml` | 수정 (baseline_score 고정) | T7 |
 
+### T8~T17 (고급 최적화)
+
+| 파일 | 변경 유형 | 태스크 |
+|------|----------|--------|
+| `app/core/agents/db/agent.py` | 수정 (Self-Consistency, 캐싱, Verification, AST 수정 연동) | T8, T9, T12, T17 |
+| `app/core/agents/db/verification.py` | 신규 | T9 |
+| `tests/unit/test_verification.py` | 신규 | T9 |
+| `db/migrations/005_eval_metrics.sql` | 신규 (eval_case 컬럼 추가) | T10 |
+| `tests/golden/metrics.py` | 수정 (EX / Component Match / Valid SQL Rate 추가) | T10 |
+| `tests/golden/datasets/db_phase1.yaml` | 수정 (`expected_sql` 필드 추가) | T10 |
+| `app/core/agents/db/schema_linker.py` | 수정 (2단계 재랭킹) | T11 |
+| `config/prompts/schema_rerank.j2` | 신규 | T11 |
+| `tests/unit/test_schema_linker_rerank.py` | 신규 | T11 |
+| `db/migrations/006_query_log_cache.sql` | 신규 (question_hash 컬럼) | T12 |
+| `app/infra/db/query_log.py` | 수정 (get_cached_sql, save_success) | T12 |
+| `app/core/agents/db/value_matcher.py` | 신규 | T13 |
+| `tests/unit/test_value_matcher.py` | 신규 | T13 |
+| `config/few_shot/sql_antipatterns.yaml` | 신규 | T14 |
+| `config/prompts/sql_gen.j2` | 수정 (anti-pattern 섹션 추가) | T14 |
+| `db/migrations/007_active_learning.sql` | 신규 | T15 |
+| `app/infra/db/active_learning_repo.py` | 신규 | T15 |
+| `app/infra/llm/ensemble.py` | 신규 | T16 |
+| `app/core/agents/db/ast_repair.py` | 신규 | T17 |
+| `tests/unit/test_ast_repair.py` | 신규 | T17 |
+| `requirements.txt` | 수정 (sqlglot, rapidfuzz 추가) | T10, T13, T17 |
+
 ---
 
 ## 11. 논문 활용 방법
@@ -1087,24 +1904,61 @@ py -m pytest -m real_llm tests/golden -v -s
 이 구현이 완료되면:
 
 1. **실험 재현성:** `eval_run` 테이블에 `git_sha` 기록 → 어느 커밋에서 어떤 점수였는지 추적 가능
-2. **Ablation Study:** T3(ValueStore) → T4(Few-shot) → T6(CoT) 순서로 각각 Golden Eval 실행 → 각 개선분이 점수에 미친 영향 측정
-3. **결과 표 형태:**
+2. **Ablation Study:** T3(ValueStore) → T4(Few-shot) → T6(CoT) → T8~T17 순서로 각각 Golden Eval 실행 → 각 개선분이 점수에 미친 영향 측정
 
-| 구성 | EX Score | Valid SQL % | Hard EX |
-|------|----------|-------------|---------|
-| Baseline | ? | ? | ? |
-| + ValueStore | ? | ? | ? |
-| + Few-shot 20개 | ? | ? | ? |
-| + Chain-of-Thought | ? | ? | ? |
+### Ablation Study 결과 표
 
-4. **데이터 추출:**
+| 구성 | EX Score | Valid SQL % | Hard EX | Latency(ms) |
+|------|----------|-------------|---------|-------------|
+| Baseline (T1~T2만) | ? | ? | ? | ? |
+| + ValueStore (T3) | ? | ? | ? | ? |
+| + Few-shot 20개 (T4) | ? | ? | ? | ? |
+| + Schema 설명 개선 (T5) | ? | ? | ? | ? |
+| + Chain-of-Thought (T6) | ? | ? | ? | ? |
+| + AST 수정 (T17) | ? | ? | ? | ? |
+| + Fuzzy Matching (T13) | ? | ? | ? | ? |
+| + Anti-pattern (T14) | ? | ? | ? | ? |
+| + Schema Linker 2단계 (T11) | ? | ? | ? | ? |
+| + Self-Consistency N=3 (T8) | ? | ? | ? | ? |
+| Full System (모두 적용) | ? | ? | ? | ? |
+
+> **측정 방법:** 각 구성을 별도 git 브랜치에서 Golden Eval 실행 → `eval_run.git_sha`로 추적. 논문 Table 1로 활용.
+
+### 평가 지표 설명
+
+| 지표 | 수식 | 의미 |
+|------|------|------|
+| **EX (Execution Accuracy)** | 실행 결과 집합 일치 / 전체 케이스 | 실제 DB 결과 기준 정확도 |
+| **Valid SQL %** | 파싱 성공 SQL / 전체 생성 SQL | 문법 오류 없는 SQL 비율 |
+| **Hard EX** | Hard 난이도 EX | 복잡한 쿼리 처리 능력 |
+| **Keyword Score** | 키워드 포함 / 기대 키워드 | 경량 근사 지표 (실 DB 불필요) |
+| **Component Match** | FROM/WHERE/SELECT 절 일치율 | 구조 수준 정확도 |
+
+### 데이터 추출 쿼리
+
 ```sql
-SELECT r.git_sha, r.overall_score,
+-- 전체 실험 결과 추이
+SELECT r.run_id, r.git_sha, r.overall_score,
+       r.passed, r.total,
        SUM(CASE WHEN c.difficulty='hard' AND c.passed=1 THEN 1 ELSE 0 END) AS hard_passed,
-       COUNT(CASE WHEN c.difficulty='hard' THEN 1 END) AS hard_total
+       COUNT(CASE WHEN c.difficulty='hard' THEN 1 END) AS hard_total,
+       AVG(c.execution_accuracy) AS avg_ex,
+       SUM(CASE WHEN c.from_match=1 AND c.where_match=1 THEN 1 ELSE 0 END) AS full_component_match,
+       r.created_at
 FROM eval_run r
 JOIN eval_case c ON r.run_id = c.run_id
 WHERE r.dataset = 'db_phase1'
 GROUP BY r.run_id
 ORDER BY r.created_at;
+
+-- 난이도별 통과율
+SELECT c.difficulty,
+       COUNT(*) AS total,
+       SUM(c.passed) AS passed,
+       ROUND(AVG(c.score), 4) AS avg_score,
+       ROUND(AVG(c.execution_accuracy), 4) AS avg_ex
+FROM eval_case c
+JOIN eval_run r ON c.run_id = r.run_id
+WHERE r.run_id = (SELECT MAX(run_id) FROM eval_run WHERE dataset='db_phase1')
+GROUP BY c.difficulty;
 ```
