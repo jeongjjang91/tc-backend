@@ -2332,3 +2332,122 @@ JOIN eval_run r ON c.run_id = r.run_id
 WHERE r.run_id = (SELECT MAX(run_id) FROM eval_run WHERE dataset='db_phase1')
 GROUP BY c.difficulty;
 ```
+---
+
+## 12. External Builder Benchmark Review + My Opinion
+
+This section summarizes the document through the lens of five publicly visible builders/operators who have repeatedly emphasized practical standards for production LLM web services.
+
+### 12-1. Five reference builders
+
+1. Greg Brockman, OpenAI
+2. Dario Amodei, Anthropic
+3. Guillermo Rauch, Vercel
+4. Harrison Chase, LangChain
+5. Simon Willison, independent researcher/builder
+
+### 12-2. Three criteria each, with quantitative/qualitative scoring
+
+| Person | Criterion 1 | Score | Criterion 2 | Score | Criterion 3 | Score | Qualitative take |
+|--------|-------------|------:|-------------|------:|-------------|------:|------------------|
+| Greg Brockman | Evals must reflect real product behavior | 9/10 | Engineering process must be repeatable | 8/10 | Iterative improvement after deployment | 7/10 | Strong fit because this document centers measurement, regression tracking, and repeatable evaluation |
+| Dario Amodei | Reliability / steerability | 7/10 | Human feedback and safety rails | 6/10 | Avoid unnecessary complexity until proven | 5/10 | Accuracy direction is good, but the proposed system expands in complexity quickly |
+| Guillermo Rauch | Latency and streaming UX matter | 8/10 | Provider / model swap flexibility | 8/10 | Operational reliability and visibility | 6/10 | Pre-filtering and model routing are strong, but reliability/failover/ops detail is still light |
+| Harrison Chase | Trace-based eval and agent-level measurement | 8/10 | Observability and regression prevention | 8/10 | Harness/tool interface quality | 7/10 | The eval and CI mindset is solid; tool/state interface contracts can be sharpened further |
+| Simon Willison | Prompt injection and permission boundaries | 3/10 | Simplicity and debuggability | 6/10 | Respect for simple techniques like rules/logs/keywords | 8/10 | The document respects lightweight routing well, but security and trust boundaries are underdeveloped |
+
+### 12-3. Overall scores for this plan
+
+| Area | Score | Notes |
+|------|------:|------|
+| Accuracy improvement direction | 8.5/10 | Good priorities around schema, few-shot, value grounding, and richer metrics |
+| Operational readiness | 7.0/10 | Good offline evaluation foundation, but production failure handling is still incomplete |
+| Performance / responsiveness | 7.5/10 | Planner pre-filter and model routing are practical wins |
+| Security / permission boundaries | 4.0/10 | Prompt injection, policy-violating SQL attempts, and abuse cases are barely covered |
+| Complexity control | 5.5/10 | Too many advanced ideas arrive at once, making attribution and rollback harder |
+
+### 12-4. What looks strong
+
+The strongest part of this document is that it treats improvement as a measurement problem first, not a prompt-writing problem. The `eval_run` / `eval_case` design, baseline/regression tracking, latency capture, and richer metrics such as EX / Valid SQL / Component Match are all aligned with how strong LLM web services are usually improved in practice.
+
+Another strong point is the explicit focus on user-visible responsiveness. Planner pre-filtering, confidence-based lightweight classification, and model routing are all realistic levers for improving web-service experience without changing the full product architecture.
+
+### 12-5. What looks weak
+
+The weakest area is security and trust-boundary design. The document focuses heavily on Text-to-SQL accuracy, but it does not yet define a serious security-eval track for prompt injection, policy-violating SQL attempts, schema/value poisoning, or ambiguous requests that should be refused or routed away.
+
+The second weak point is complexity control. T8~T20 contain many individually reasonable ideas, but introducing self-consistency, ensemble execution, AST repair, active learning, and multi-model routing too quickly will make it difficult to know which change actually helped or hurt.
+
+The third weak point is online feedback integration. Offline golden eval is strong here, but production LLM services usually need a much tighter loop from real traffic traces, low-confidence turns, retries, and reviewer feedback back into the evaluation dataset.
+
+### 12-6. My opinion on the best execution order
+
+If the goal is to improve this project safely and with clear attribution, I would sequence the work more aggressively than the current draft.
+
+**Do first**
+- T1 eval persistence
+- T3 real ValueStore loading
+- T4 few-shot expansion
+- T5 schema description quality management
+- T10 richer evaluation metrics
+- T18 planner pre-filter
+
+**Do next**
+- T11 two-stage schema linker
+- T13 fuzzy value matching
+- T19 planner confidence + light-model fallback
+- T20 model router, but initially route everything to the same model and only introduce split routing after eval confirmation
+
+**Do later**
+- T8 self-consistency
+- T16 ensemble
+- T17 AST repair
+- T15 active learning loop
+
+The reason is simple: in the current system, the highest-ROI changes are still better grounding, better routing, and better measurement. More complex post-generation correction techniques should come after those simpler inputs and control layers are already working well.
+
+### 12-7. Four additions I recommend
+
+1. Add a dedicated `security eval` track
+   - Include prompt injection attempts, forbidden-table requests, unsafe SQL steering attempts, and ambiguous policy-boundary questions
+   - Track metrics such as `unsafe_sql_rate` and `policy_violation_escape_rate`
+
+2. Add an `online trace review` loop before a full active-learning loop
+   - Sample real `/chat` failures, retries, and low-confidence turns
+   - Promote those cases into golden datasets on a regular cadence
+
+3. Define explicit latency budgets per stage
+   - planner `< 300ms`
+   - schema linking `< 1.5s`
+   - SQL generation `< 5s`
+   - full turn P50 / P95 budget tracked continuously
+
+4. Define rollback guardrails, not just a single score target
+   - Reject a change if EX improves but P95 latency doubles
+   - Reject a change if Valid SQL improves but unsafe behavior increases
+   - Treat improvements as multi-metric, not single-metric
+
+### 12-8. Bottom line
+
+As an accuracy-improvement roadmap, this document is strong. As a full production-LLM web-service roadmap, it is still relatively weak on security and complexity management.
+
+My overall score for the current plan is **7.4/10**.
+
+If I were executing it, I would finish T1 / T3 / T4 / T5 / T10 / T18 first, then use real traces and ablation results to decide how much of T11 / T13 / T19 / T20 should actually be adopted.
+
+### 12-9. Reference links
+
+- OpenAI, evals primer: https://openai.com/index/evals-drive-next-chapter-of-ai/
+- OpenAI eval best practices: https://platform.openai.com/docs/guides/evaluation-best-practices
+- Anthropic, Building Effective AI Agents: https://www.anthropic.com/research/building-effective-agents
+- Anthropic, Demystifying evals for AI agents: https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
+- Anthropic eval design docs: https://docs.anthropic.com/en/docs/build-with-claude/develop-tests
+- Vercel, AI SDK 5: https://vercel.com/blog/ai-sdk-5
+- Vercel, AI Gateway GA: https://vercel.com/blog/ai-gateway-is-now-generally-available
+- Vercel streaming guide: https://vercel.com/kb/guide/streaming-from-llm
+- LangChain, Agent Evaluation Readiness Checklist: https://blog.langchain.com/agent-evaluation-readiness-checklist/
+- LangChain, On Agent Frameworks and Agent Observability: https://blog.langchain.com/on-agent-frameworks-and-agent-observability/
+- LangChain, Your harness, your memory: https://blog.langchain.com/your-harness-your-memory/
+- Simon Willison, Prompt injection risks: https://simonwillison.net/2023/Apr/14/worst-that-can-happen/
+- Simon Willison, Prompt injection vs jailbreaking: https://simonwillison.net/2024/Mar/5/prompt-injection-and-jailbreaking-are-not-the-same-thing/
+- Simon Willison, practical LLM lessons: https://simonwillison.net/2024/May/29/a-year-of-building-with-llms/
