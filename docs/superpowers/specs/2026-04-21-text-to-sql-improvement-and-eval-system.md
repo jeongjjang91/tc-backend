@@ -46,6 +46,9 @@
 | T15 | Active Learning Loop (저신뢰 케이스 큐) | 신규 | 2h |
 | T16 | Multi-model Ensemble (GPT-OSS + Gemma4) | 신규 | 2h |
 | T17 | SQL AST 정적 수정 (sqlglot) | 신규 | 1.5h |
+| T18 | QueryPlanner Pre-filter + SmallTalkAgent (잡담/인사 라우팅) | 신규 | 1.5h |
+| T19 | QueryPlanner Rule 신뢰도 스코어링 + 경량 LLM 분류기 | 수정 | 2h |
+| T20 | Multi-Model Task Routing (ModelRouter + per-task 모델 할당) | 신규 | 2h |
 
 ### 이번에 구현하지 않는 것
 
@@ -1851,6 +1854,357 @@ def test_limit_auto_injection():
 
 ---
 
+### T18. QueryPlanner Pre-filter + SmallTalkAgent (잡담/인사 라우팅)
+
+**목적:** 현재 QueryPlanner의 default="db" 구조로 인해 "안녕", "고마워" 같은 잡담도 Text-to-SQL 파이프라인(20초)으로 진입하는 버그 해결. Pre-filter로 즉시 분기하여 100ms 내 응답.
+
+**현재 문제:**
+- `_classify_rule()` 어떤 패턴도 안 맞으면 무조건 `"db"` 반환 (line 33 in planner.py)
+- "안녕" → db agent → 20초 소요 후 의미없는 SQL 시도
+- 빈 메시지, 2글자 입력도 동일
+
+**구현: `app/core/orchestrator/planner.py` 수정**
+
+```python
+# app/core/orchestrator/planner.py
+
+import re
+import uuid
+from app.shared.schemas import SubQuery
+from app.shared.logging import get_logger
+
+logger = get_logger(__name__)
+
+# --- 기존 패턴 유지 ---
+_DOC_PATTERNS = [...]
+_LOG_PATTERNS = [...]
+_KNOWLEDGE_PATTERNS = [...]
+
+# --- 신규: Pre-filter 패턴 ---
+_SMALLTALK_PATTERNS = [
+    r"^(안녕|하이|하이요|hello|hi|헬로)[\s.!?~ㅎㅋ]*$",
+    r"^(고마워|감사|ㄱㅅ|thank|thx)",
+    r"^(넵|네|응|ok|okay|알겠|오케이)[\s.!?~]*$",
+    r"^[ㅋㅎㅠ\s]+$",          # 이모티콘만
+]
+_REJECT_PATTERNS = [
+    r"^\s*$",                   # 공백만
+    r"^.{0,1}$",                # 1글자 이하
+]
+
+
+def prefilter(msg: str) -> str | None:
+    """즉각 분기 가능한 유형 식별.
+    Returns: 'smalltalk' | 'reject' | None (None이면 계속 분류)
+    """
+    stripped = msg.strip()
+    for pat in _REJECT_PATTERNS:
+        if re.match(pat, stripped):
+            return "reject"
+    for pat in _SMALLTALK_PATTERNS:
+        if re.match(pat, stripped, re.IGNORECASE):
+            return "smalltalk"
+    return None
+
+
+class QueryPlanner:
+    async def plan_async(self, message: str, session_id: str, ...) -> list[SubQuery]:
+        # Stage 1: Pre-filter (0초)
+        pre = prefilter(message)
+        if pre in ("smalltalk", "reject"):
+            return [SubQuery(id=str(uuid.uuid4()), agent=pre, query=message)]
+
+        # Stage 2: Rule-based (0초)
+        if self._llm and self._renderer:
+            ...  # 기존 LLM 분류
+        agent = _classify_rule(message)
+        return [SubQuery(id=str(uuid.uuid4()), agent=agent, query=message)]
+```
+
+**신규 파일: `app/core/agents/smalltalk/agent.py`**
+
+```python
+# app/core/agents/smalltalk/agent.py
+
+from app.core.agents.base import Agent, AgentResult
+from app.shared.schemas import SubQuery
+import re
+
+class SmallTalkAgent(Agent):
+    """잡담/인사/감사 전용 Agent. LLM 없이 템플릿으로 즉답."""
+
+    _TEMPLATES = {
+        "greeting": [
+            r"안녕|hello|hi|하이",
+            "안녕하세요! TC 설비 관련 질문을 해주시면 도와드리겠습니다.",
+        ],
+        "thanks": [
+            r"고마워|감사|thank",
+            "도움이 되셨다니 다행입니다. 추가 질문 있으시면 말씀해주세요.",
+        ],
+        "ack": [
+            r"넵|네|응|ok|알겠",
+            "네, 언제든지 질문해주세요.",
+        ],
+    }
+
+    async def run(self, subquery: SubQuery, **kwargs) -> AgentResult:
+        msg = subquery.query.strip().lower()
+        for _, (pattern, response) in self._TEMPLATES.items():
+            if re.search(pattern, msg, re.IGNORECASE):
+                return AgentResult(
+                    answer=response,
+                    confidence=1.0,
+                    agent="smalltalk",
+                    latency_ms=1,
+                )
+        # 템플릿 미매치 → 범용 응답
+        return AgentResult(
+            answer="TC VOC 챗봇입니다. 설비 조회, 파라미터 확인, 장애 분석 등 질문해주세요.",
+            confidence=1.0,
+            agent="smalltalk",
+            latency_ms=1,
+        )
+```
+
+**`reject` 처리:** Orchestrator에서 `agent=="reject"` 감지 시 "질문을 입력해주세요." 즉답 반환 (Agent 불필요).
+
+**테스트:** `tests/unit/test_planner_prefilter.py`
+```python
+def test_greeting_routes_to_smalltalk():
+    pre = prefilter("안녕")
+    assert pre == "smalltalk"
+
+def test_empty_routes_to_reject():
+    pre = prefilter("  ")
+    assert pre == "reject"
+
+def test_db_question_passes_through():
+    pre = prefilter("L01 라인 설비 목록 알려줘")
+    assert pre is None  # 계속 분류
+```
+
+---
+
+### T19. QueryPlanner Rule 신뢰도 스코어링 + 경량 LLM 분류기
+
+**목적:** 현재 `_classify_rule()` 은 매칭 여부만 판단하고 신뢰도를 반환하지 않음. default="db"로 낙찰되는 애매한 케이스를 경량 LLM에 위임하여 정확도 향상. 대형 LLM은 쓰지 않음.
+
+**기존 문제:**
+- "L01 설비가 이상해" → "이상" 패턴 없음 → db (정답: log)
+- "PARAM_A 어떻게 써?" → "설명" 없음 → db (정답: doc)
+- 신뢰도 정보 없어서 LLM 위임 여부를 판단할 수 없음
+
+**구현: `_classify_rule()` 확장**
+
+```python
+def _classify_rule_with_confidence(msg: str) -> tuple[str, float]:
+    """Returns: (agent, confidence 0.0~1.0)"""
+    match_counts = {"log": 0, "doc": 0, "knowledge": 0}
+    for pat in _LOG_PATTERNS:
+        if re.search(pat, msg):
+            match_counts["log"] += 1
+    for pat in _DOC_PATTERNS:
+        if re.search(pat, msg):
+            match_counts["doc"] += 1
+    for pat in _KNOWLEDGE_PATTERNS:
+        if re.search(pat, msg):
+            match_counts["knowledge"] += 1
+
+    best = max(match_counts, key=match_counts.get)
+    count = match_counts[best]
+
+    if count >= 2:
+        return best, 0.95   # 강한 매치
+    if count == 1:
+        return best, 0.65   # 약한 매치 → LLM 검토 권장
+    return "db", 0.40       # 기본값, 낮은 신뢰도 → LLM 검토 권장
+```
+
+**경량 LLM 분류기 (신뢰도 < 0.7 인 경우만 호출)**
+
+```python
+# config/prompts/planner.j2 (신규)
+당신은 질문을 아래 4가지 유형으로 분류하는 분류기입니다.
+
+유형:
+- db: 설비 데이터 조회 (SQL 필요)
+- doc: 기능 설명, 동작 원리 설명 (문서 검색)
+- log: 오동작, 에러, 장애 원인 분석 (로그 분석)
+- knowledge: 운영 노하우, FAQ, 팁
+
+질문: {{ question }}
+
+JSON만 반환: {"agent": "<유형>", "reason": "<한 줄 근거>"}
+```
+
+```python
+# QueryPlanner.plan_async()
+agent, conf = _classify_rule_with_confidence(message)
+
+if conf < 0.7 and self._llm_light and self._renderer:
+    try:
+        prompt = self._renderer.render("planner", question=message)
+        result = await self._llm_light.complete_json(prompt)  # 경량 모델, ~1~2초
+        agent = result.get("agent", agent)
+        logger.info("planner_llm_classify", agent=agent, conf=conf)
+    except Exception:
+        pass  # 실패 시 rule 결과 사용
+
+return [SubQuery(id=str(uuid.uuid4()), agent=agent, query=message)]
+```
+
+**설정:** `config/llm_routing.yaml`
+```yaml
+routing:
+  planner: gemma4-4b        # 경량 모델, ~1~2초
+  schema_linking: gemma4-4b
+  sql_generation: gpt-oss
+  refine: gpt-oss
+  interpretation: gemma4-4b  # 또는 템플릿
+```
+
+**기대 효과:**
+
+| 케이스 | 기존 | 개선 후 |
+|--------|------|---------|
+| "안녕" | db (20초) | smalltalk (<100ms) |
+| "L01 설비가 이상해" | db (오분류) | log (경량 LLM 정분류, +1~2초) |
+| "EQPID가 뭐야?" | doc (패턴 매치) | doc (동일, 0초) |
+| "L01 라인 설비 목록" | db (고신뢰 rule) | db (0초) |
+
+---
+
+### T20. Multi-Model Task Routing (ModelRouter)
+
+**목적:** 파이프라인 각 단계에 최적 모델을 할당. 경량 모델로 교체 가능한 단계를 분리하여 전체 레이턴시 단축. 사내에 여러 GPT 모델이 존재하는 환경에 맞게 config 기반으로 교체 가능하게 구성.
+
+**레이턴시 목표:**
+
+| 구성 | 예상 P50 |
+|------|---------|
+| 현재 (모두 대형 모델, 4콜 순차) | ~20초 |
+| 경량 모델 Schema Linking + Interpretation | ~11초 |
+| + Interpretation 템플릿화 (LLM 콜 제거) | ~8초 |
+| + Query Log 캐시 히트 (T12) | <500ms |
+
+**단계별 모델 권장 배정:**
+
+| 단계 | 작업 성격 | 권장 모델 | 근거 |
+|------|----------|-----------|------|
+| Planner 분류 | 4-class 분류 | 경량 | 추론 깊이 불필요 |
+| Schema Linking | 후보 중 선택 | 경량 | 분류 태스크 |
+| SQL Generation | 복잡한 구조 추론 | 대형 | 가장 틀리기 쉬운 단계 |
+| Refine (조건부) | 오류 디버깅 | 대형 | 복잡한 수정 |
+| Interpretation | 자연어 생성 | 경량 or 템플릿 | 구조화 결과 → 템플릿 우선 |
+
+**신규 파일: `app/infra/llm/router.py`**
+
+```python
+# app/infra/llm/router.py
+
+from app.infra.llm.base import LLMProvider
+
+class ModelRouter:
+    """task 이름 → LLMProvider 매핑. config로 모델 교체 가능."""
+
+    def __init__(self, providers: dict[str, LLMProvider], routing: dict[str, str]):
+        # providers: {"gpt-oss": GptOssProvider(...), "gemma4-4b": GemmaProvider(...)}
+        # routing:   {"sql_generation": "gpt-oss", "schema_linking": "gemma4-4b", ...}
+        self._providers = providers
+        self._routing = routing
+
+    def get(self, task: str) -> LLMProvider:
+        model_name = self._routing.get(task, "gpt-oss")  # 없으면 대형 모델 폴백
+        provider = self._providers.get(model_name)
+        if provider is None:
+            raise ValueError(f"Unknown model '{model_name}' for task '{task}'")
+        return provider
+```
+
+**설정 파일: `config/llm_routing.yaml`**
+
+```yaml
+# config/llm_routing.yaml
+# task별 사용 모델 매핑. 모델명은 .env의 LLM_MODEL_* 변수와 일치.
+routing:
+  planner:          gemma4-4b   # 경량, ~1초
+  schema_linking:   gemma4-4b   # 경량, ~2초
+  sql_generation:   gpt-oss     # 대형, ~7초 (핵심 단계)
+  refine:           gpt-oss     # 대형, 조건부 실행
+  interpretation:   template    # 템플릿 우선, 복잡한 경우만 gemma4-4b
+
+ensemble:
+  sql_generation:
+    enabled: false            # 비용 2배 → 기본 비활성화
+    models: [gpt-oss, gpt-oss-v2]
+    strategy: execution_majority
+    timeout_sec: 12
+    min_agreement: 0.8        # 이 이하면 active_learning_queue 등록
+```
+
+**`.env.example`에 추가:**
+```bash
+# Multi-model (ModelRouter용)
+LLM_MODEL_LIGHT=gemma4-4b      # 경량 모델 (Planner, Schema Linking, Interpretation)
+LLM_MODEL_HEAVY=gpt-oss        # 대형 모델 (SQL Generation, Refine)
+LLM_API_BASE_URL_LIGHT=http://internal-llm-api/v1   # 경량 모델 엔드포인트 (대형과 다를 수 있음)
+```
+
+**Agent에서 사용:**
+```python
+# app/core/agents/db/agent.py
+class DBAgent(Agent):
+    def __init__(self, model_router: ModelRouter, ...):
+        self.router = model_router
+
+    async def run(self, subquery, **kwargs):
+        schema_llm = self.router.get("schema_linking")   # 경량
+        sql_llm = self.router.get("sql_generation")       # 대형
+        interp_llm = self.router.get("interpretation")    # 경량 or template
+
+        linked = await self.schema_linker.link(subquery.query, llm=schema_llm)
+        sql = await self.sql_generator.generate(..., llm=sql_llm)
+        answer = await self._interpret(sql, rows, llm=interp_llm)
+```
+
+**인터프리테이션 템플릿화 (LLM 콜 -1):**
+```python
+# config 라우팅이 "template"이면 LLM 없이 처리
+def _interpret(self, sql, rows, llm) -> str:
+    if self.router._routing.get("interpretation") == "template":
+        return self._template_answer(sql, rows)  # 즉시 반환
+    return await llm.complete(self._interp_prompt(sql, rows))
+
+def _template_answer(self, sql: str, rows: list) -> str:
+    if not rows:
+        return "조회 결과가 없습니다."
+    col_names = list(rows[0].keys())
+    return f"총 {len(rows)}건 조회되었습니다. 주요 컬럼: {', '.join(col_names)}"
+```
+
+**주의사항:**
+1. **모델별 프롬프트 개별 튜닝 필요** — Gemma4는 few-shot 더 필요, GPT-OSS는 system prompt에 민감. Golden Eval에서 `llm_model` 컬럼(T1 DDL에 이미 있음)으로 모델별 점수 추적.
+2. **초기에는 routing 전체를 gpt-oss로** — ModelRouter 구조만 먼저 도입 후, 한 태스크씩 경량 교체하면서 Golden Eval 통과 확인. 교체 실패 시 즉시 롤백.
+3. **SQL Generation은 절대 경량 교체 금지** (정확도 핵심 단계).
+
+**테스트:** `tests/unit/test_model_router.py`
+```python
+def test_router_returns_correct_provider():
+    router = ModelRouter(
+        providers={"gpt-oss": mock_heavy, "gemma4-4b": mock_light},
+        routing={"sql_generation": "gpt-oss", "schema_linking": "gemma4-4b"},
+    )
+    assert router.get("sql_generation") is mock_heavy
+    assert router.get("schema_linking") is mock_light
+
+def test_router_fallback_to_heavy_for_unknown_task():
+    router = ModelRouter(providers=..., routing={})
+    assert router.get("unknown_task") is mock_heavy  # gpt-oss 폴백
+```
+
+---
+
 ## 10. 파일 변경 요약
 
 ### T1~T7 (기초 인프라)
@@ -1897,6 +2251,20 @@ def test_limit_auto_injection():
 | `tests/unit/test_ast_repair.py` | 신규 | T17 |
 | `requirements.txt` | 수정 (sqlglot, rapidfuzz 추가) | T10, T13, T17 |
 
+### T18~T20 (Planner 개선 + Multi-Model)
+
+| 파일 | 변경 유형 | 태스크 |
+|------|----------|--------|
+| `app/core/orchestrator/planner.py` | 수정 (prefilter, confidence scoring, 경량 LLM 분류) | T18, T19 |
+| `app/core/agents/smalltalk/agent.py` | 신규 | T18 |
+| `tests/unit/test_planner_prefilter.py` | 신규 | T18 |
+| `config/prompts/planner.j2` | 신규 | T19 |
+| `tests/unit/test_planner_confidence.py` | 신규 | T19 |
+| `app/infra/llm/router.py` | 신규 | T20 |
+| `config/llm_routing.yaml` | 신규 | T20 |
+| `.env.example` | 수정 (LLM_MODEL_LIGHT, LLM_MODEL_HEAVY 추가) | T20 |
+| `tests/unit/test_model_router.py` | 신규 | T20 |
+
 ---
 
 ## 11. 논문 활용 방법
@@ -1920,6 +2288,8 @@ def test_limit_auto_injection():
 | + Anti-pattern (T14) | ? | ? | ? | ? |
 | + Schema Linker 2단계 (T11) | ? | ? | ? | ? |
 | + Self-Consistency N=3 (T8) | ? | ? | ? | ? |
+| + Planner Pre-filter (T18) | - | - | - | ~100ms (잡담) |
+| + ModelRouter 경량 분리 (T20) | ? | ? | ? | ~8~12초 (일반) |
 | Full System (모두 적용) | ? | ? | ? | ? |
 
 > **측정 방법:** 각 구성을 별도 git 브랜치에서 Golden Eval 실행 → `eval_run.git_sha`로 추적. 논문 Table 1로 활용.
