@@ -2334,11 +2334,11 @@ GROUP BY c.difficulty;
 ```
 ---
 
-## 12. External Builder Benchmark Review + My Opinion
+## 12. 외부 거장 관점 비교 평가 + 내 의견
 
-This section summarizes the document through the lens of five publicly visible builders/operators who have repeatedly emphasized practical standards for production LLM web services.
+이 섹션은 공개적으로 LLM 웹서비스 구축 원칙을 많이 드러낸 다섯 명의 관점을 기준으로, 현재 문서의 강점과 약점을 비교 평가한 내용이다.
 
-### 12-1. Five reference builders
+### 12-1. 비교 대상으로 잡은 5명
 
 1. Greg Brockman, OpenAI
 2. Dario Amodei, Anthropic
@@ -2346,45 +2346,45 @@ This section summarizes the document through the lens of five publicly visible b
 4. Harrison Chase, LangChain
 5. Simon Willison, independent researcher/builder
 
-### 12-2. Three criteria each, with quantitative/qualitative scoring
+### 12-2. 각자 중요하게 볼 기준 3개와 정량/정성 평가
 
-| Person | Criterion 1 | Score | Criterion 2 | Score | Criterion 3 | Score | Qualitative take |
-|--------|-------------|------:|-------------|------:|-------------|------:|------------------|
-| Greg Brockman | Evals must reflect real product behavior | 9/10 | Engineering process must be repeatable | 8/10 | Iterative improvement after deployment | 7/10 | Strong fit because this document centers measurement, regression tracking, and repeatable evaluation |
-| Dario Amodei | Reliability / steerability | 7/10 | Human feedback and safety rails | 6/10 | Avoid unnecessary complexity until proven | 5/10 | Accuracy direction is good, but the proposed system expands in complexity quickly |
-| Guillermo Rauch | Latency and streaming UX matter | 8/10 | Provider / model swap flexibility | 8/10 | Operational reliability and visibility | 6/10 | Pre-filtering and model routing are strong, but reliability/failover/ops detail is still light |
-| Harrison Chase | Trace-based eval and agent-level measurement | 8/10 | Observability and regression prevention | 8/10 | Harness/tool interface quality | 7/10 | The eval and CI mindset is solid; tool/state interface contracts can be sharpened further |
-| Simon Willison | Prompt injection and permission boundaries | 3/10 | Simplicity and debuggability | 6/10 | Respect for simple techniques like rules/logs/keywords | 8/10 | The document respects lightweight routing well, but security and trust boundaries are underdeveloped |
+| 인물 | 기준 1 | 점수 | 기준 2 | 점수 | 기준 3 | 점수 | 정성 평가 |
+|------|--------|-----:|--------|-----:|--------|-----:|----------|
+| Greg Brockman | 실제 제품 동작을 반영하는 eval | 9/10 | 반복 가능한 엔지니어링 프로세스 | 8/10 | 배포 후 점진적 개선 구조 | 7/10 | 이 문서는 측정, 회귀 확인, 반복 개선 관점이 강해서 Brockman식 접근과 잘 맞는다 |
+| Dario Amodei | 신뢰성 / steerability | 7/10 | human feedback과 안전 장치 | 6/10 | 검증되기 전 복잡도 확대 억제 | 5/10 | 정확도 개선 방향은 좋지만 제안 기능이 빠르게 많아져 복잡도 리스크가 크다 |
+| Guillermo Rauch | latency와 체감 UX | 8/10 | provider / model 교체 가능성 | 8/10 | 운영 신뢰성과 가시성 | 6/10 | pre-filter와 model routing은 좋지만 failover, 운영 visibility는 약하다 |
+| Harrison Chase | trace 기반 eval과 agent 단위 측정 | 8/10 | observability와 regression 방지 | 8/10 | harness / tool interface 품질 | 7/10 | eval/CI 사고방식은 좋고, 상태/도구 인터페이스 계약은 더 구체화될 여지가 있다 |
+| Simon Willison | prompt injection과 권한 경계 | 3/10 | 단순성 / 디버깅 용이성 | 6/10 | 규칙/로그/키워드 같은 단순 기법 존중 | 8/10 | 경량 라우팅은 좋지만 보안과 trust boundary 설계가 매우 약하다 |
 
-### 12-3. Overall scores for this plan
+### 12-3. 이 문서 전체에 대한 종합 점수
 
-| Area | Score | Notes |
-|------|------:|------|
-| Accuracy improvement direction | 8.5/10 | Good priorities around schema, few-shot, value grounding, and richer metrics |
-| Operational readiness | 7.0/10 | Good offline evaluation foundation, but production failure handling is still incomplete |
-| Performance / responsiveness | 7.5/10 | Planner pre-filter and model routing are practical wins |
-| Security / permission boundaries | 4.0/10 | Prompt injection, policy-violating SQL attempts, and abuse cases are barely covered |
-| Complexity control | 5.5/10 | Too many advanced ideas arrive at once, making attribution and rollback harder |
+| 항목 | 점수 | 코멘트 |
+|------|-----:|--------|
+| 정확도 개선 방향 | 8.5/10 | schema, few-shot, value grounding, richer metrics 우선순위가 좋다 |
+| 운영 준비도 | 7.0/10 | offline eval 기반은 좋지만 production failure loop는 아직 약하다 |
+| 성능 / 응답성 | 7.5/10 | planner pre-filter와 model routing은 실전적인 개선 포인트다 |
+| 보안 / 권한 경계 | 4.0/10 | prompt injection, 정책 위반 SQL 유도, 악성 입력 대응이 거의 없다 |
+| 복잡도 통제 | 5.5/10 | 좋은 아이디어가 많지만 한 번에 많이 들어오면 원인 추적과 rollback이 어려워진다 |
 
-### 12-4. What looks strong
+### 12-4. 어디가 괜찮은지
 
-The strongest part of this document is that it treats improvement as a measurement problem first, not a prompt-writing problem. The `eval_run` / `eval_case` design, baseline/regression tracking, latency capture, and richer metrics such as EX / Valid SQL / Component Match are all aligned with how strong LLM web services are usually improved in practice.
+이 문서의 가장 큰 장점은 개선을 프롬프트 감각 문제가 아니라 측정 문제로 다룬다는 점이다. `eval_run`, `eval_case`, baseline/regression, latency 기록, EX / Valid SQL / Component Match 같은 지표 확장은 실제 운영형 LLM 서비스 개선 방식과 잘 맞는다.
 
-Another strong point is the explicit focus on user-visible responsiveness. Planner pre-filtering, confidence-based lightweight classification, and model routing are all realistic levers for improving web-service experience without changing the full product architecture.
+또 다른 장점은 사용자 체감 속도를 아키텍처 레벨에서 다루려는 점이다. planner pre-filter, confidence 기반 경량 분류, model routing은 웹서비스에서 바로 체감되는 개선 포인트다.
 
-### 12-5. What looks weak
+### 12-5. 어디가 약한지
 
-The weakest area is security and trust-boundary design. The document focuses heavily on Text-to-SQL accuracy, but it does not yet define a serious security-eval track for prompt injection, policy-violating SQL attempts, schema/value poisoning, or ambiguous requests that should be refused or routed away.
+가장 약한 부분은 보안과 trust-boundary 설계다. 문서는 Text-to-SQL 정확도 향상에 집중하지만, prompt injection, 금지 테이블 유도, schema/value poisoning, 애매한 정책 경계 질문에 대한 대응 설계가 거의 없다.
 
-The second weak point is complexity control. T8~T20 contain many individually reasonable ideas, but introducing self-consistency, ensemble execution, AST repair, active learning, and multi-model routing too quickly will make it difficult to know which change actually helped or hurt.
+두 번째 약점은 복잡도 통제다. T8~T20은 각각 타당하지만 self-consistency, ensemble, AST repair, active learning, multi-model routing까지 빠르게 넣으면 어떤 변화가 실제로 성능을 올렸는지 분리하기 어려워진다.
 
-The third weak point is online feedback integration. Offline golden eval is strong here, but production LLM services usually need a much tighter loop from real traffic traces, low-confidence turns, retries, and reviewer feedback back into the evaluation dataset.
+세 번째 약점은 online feedback loop가 약하다는 점이다. golden eval은 강하지만, 실제 운영에서는 실사용 trace, 저신뢰 응답, 재시도, reviewer feedback이 다시 eval set으로 들어오는 루프가 중요하다.
 
-### 12-6. My opinion on the best execution order
+### 12-6. 내가 보는 더 좋은 실행 순서
 
-If the goal is to improve this project safely and with clear attribution, I would sequence the work more aggressively than the current draft.
+안전하게 개선하고, 무엇이 효과 있었는지 명확히 남기려면 현재 초안보다 더 강하게 우선순위를 잘라서 가는 편이 좋다.
 
-**Do first**
+**먼저 할 것**
 - T1 eval persistence
 - T3 real ValueStore loading
 - T4 few-shot expansion
@@ -2392,50 +2392,52 @@ If the goal is to improve this project safely and with clear attribution, I woul
 - T10 richer evaluation metrics
 - T18 planner pre-filter
 
-**Do next**
+**그 다음 할 것**
 - T11 two-stage schema linker
 - T13 fuzzy value matching
 - T19 planner confidence + light-model fallback
-- T20 model router, but initially route everything to the same model and only introduce split routing after eval confirmation
+- T20 model router
 
-**Do later**
+T20은 처음부터 모델을 나누지 말고, 우선 같은 모델로 routing 구조만 넣은 뒤 eval 결과가 확인되면 분리하는 것이 안전하다.
+
+**나중에 할 것**
 - T8 self-consistency
 - T16 ensemble
 - T17 AST repair
 - T15 active learning loop
 
-The reason is simple: in the current system, the highest-ROI changes are still better grounding, better routing, and better measurement. More complex post-generation correction techniques should come after those simpler inputs and control layers are already working well.
+이유는 간단하다. 지금 단계에서 ROI가 가장 큰 것은 더 좋은 grounding, 더 좋은 routing, 더 좋은 measurement다. 생성 후 복잡한 보정은 그 다음이어야 한다.
 
-### 12-7. Four additions I recommend
+### 12-7. 내가 추가로 넣고 싶은 개선안 4개
 
-1. Add a dedicated `security eval` track
-   - Include prompt injection attempts, forbidden-table requests, unsafe SQL steering attempts, and ambiguous policy-boundary questions
-   - Track metrics such as `unsafe_sql_rate` and `policy_violation_escape_rate`
+1. `security eval` 트랙 추가
+   - prompt injection, forbidden-table 요청, unsafe SQL 유도, 정책 경계 질문을 별도 dataset으로 관리
+   - `unsafe_sql_rate`, `policy_violation_escape_rate` 같은 지표 추가
 
-2. Add an `online trace review` loop before a full active-learning loop
-   - Sample real `/chat` failures, retries, and low-confidence turns
-   - Promote those cases into golden datasets on a regular cadence
+2. full active-learning 전에 `online trace review` 루프 추가
+   - 실제 `/chat` 실패, 재시도, low-confidence 응답을 샘플링
+   - 주기적으로 golden dataset으로 승격
 
-3. Define explicit latency budgets per stage
+3. 단계별 latency budget 명시
    - planner `< 300ms`
    - schema linking `< 1.5s`
    - SQL generation `< 5s`
-   - full turn P50 / P95 budget tracked continuously
+   - full turn의 P50 / P95 지속 추적
 
-4. Define rollback guardrails, not just a single score target
-   - Reject a change if EX improves but P95 latency doubles
-   - Reject a change if Valid SQL improves but unsafe behavior increases
-   - Treat improvements as multi-metric, not single-metric
+4. 단일 점수 대신 rollback guardrail 명시
+   - EX가 올라가도 P95 latency가 2배면 reject
+   - Valid SQL이 좋아져도 unsafe behavior가 늘면 reject
+   - 개선 여부는 multi-metric으로 판단
 
-### 12-8. Bottom line
+### 12-8. 최종 의견
 
-As an accuracy-improvement roadmap, this document is strong. As a full production-LLM web-service roadmap, it is still relatively weak on security and complexity management.
+정확도 개선 로드맵으로 보면 이 문서는 강하다. 반면 운영형 LLM 웹서비스 로드맵으로 보면 보안과 복잡도 관리가 아직 약하다.
 
-My overall score for the current plan is **7.4/10**.
+내 총평 점수는 **7.4/10**이다.
 
-If I were executing it, I would finish T1 / T3 / T4 / T5 / T10 / T18 first, then use real traces and ablation results to decide how much of T11 / T13 / T19 / T20 should actually be adopted.
+내가 실제로 진행한다면 T1 / T3 / T4 / T5 / T10 / T18을 먼저 끝내고, 이후 실제 trace와 ablation 결과를 보고 T11 / T13 / T19 / T20을 얼마나 채택할지 결정하겠다.
 
-### 12-9. Reference links
+### 12-9. 참고 링크
 
 - OpenAI, evals primer: https://openai.com/index/evals-drive-next-chapter-of-ai/
 - OpenAI eval best practices: https://platform.openai.com/docs/guides/evaluation-best-practices
