@@ -44,7 +44,7 @@
 | T13 | Fuzzy Value Matching (rapidfuzz) | 신규 | 1h |
 | T14 | Anti-pattern Few-shot YAML | 수정 | 1h |
 | T15 | Active Learning Loop (저신뢰 케이스 큐) | 신규 | 2h |
-| T16 | Multi-model Ensemble (GPT-OSS + Gemma4) | 신규 | 2h |
+| T16 | Multi-model Ensemble (GPT-OSS + Gemma3, SQL Generation 전용·β 기본 ON) | 신규 | 2h |
 | T17 | SQL AST 정적 수정 (sqlglot) | 신규 | 1.5h |
 | T18 | QueryPlanner Pre-filter + SmallTalkAgent (잡담/인사 라우팅) | 신규 | 1.5h |
 | T19 | QueryPlanner Rule 신뢰도 스코어링 + 경량 LLM 분류기 | 수정 | 2h |
@@ -914,7 +914,7 @@ py scripts/check_schema_descriptions.py
 
 ### 7-1. 배경
 
-현재 `config/prompts/sql_gen.j2`는 Claude 기준으로 작성. GPT-OSS/Gemma4 계열 소형 LLM은:
+현재 `config/prompts/sql_gen.j2`는 Claude 기준으로 작성. GPT-OSS/Gemma3 계열 소형 LLM은:
 - JSON 출력 불안정 (코드블록 감싸거나 설명 추가)
 - MySQL LIMIT 대신 ROWNUM 쓰는 경우 있음
 - 복잡한 쿼리에서 단계적 사고 없이 틀린 SQL 생성
@@ -1695,9 +1695,11 @@ class ActiveLearningRepository:
 
 ---
 
-### T16. Multi-model Ensemble (GPT-OSS + Gemma4)
+### T16. Multi-model Ensemble (GPT-OSS + Gemma3, SQL Generation 전용)
 
-**목적:** 두 모델을 동시에 호출하여 결과를 비교. 불일치 시 검토 큐 등록. 일치 시 신뢰도 향상.
+**목적:** SQL Generation 단계에서 두 모델을 **병렬**로 호출, 실행 결과를 비교한다. 일치하면 신뢰도 상승, 불일치하면 primary(GPT-OSS) 채택 + Active Learning 큐 적재. β 라우팅(T20)에서 SQL Generation의 기본 동작이며 `enabled: true`.
+
+**적용 범위:** SQL Generation **전용**. Planner / Schema Linking / Refine / Interpretation은 단독 호출(최속 모델 또는 템플릿). Refine은 SQL 생성과 동일 프롬프트 계열이지만 조건부 호출이라 ensemble은 비용 대비 효과가 낮아 단독으로 둠 — 추후 Active Learning 결과 보고 결정.
 
 **구현 위치:** `app/infra/llm/ensemble.py` (신규)
 ```python
@@ -1743,15 +1745,9 @@ class EnsembleLLM:
             return 0.0
 ```
 
-**설정:** `config/agents.yaml`
-```yaml
-db_agent:
-  ensemble:
-    enabled: false          # 비용 2배 → 기본 비활성화
-    primary_model: gpt-oss
-    secondary_model: gemma4
-    min_agreement: 0.8      # 이 이하면 active_learning_queue 등록
-```
+**설정 위치:** Ensemble 파라미터의 **단일 출처는 `config/llm_routing.yaml`의 `ensemble` 블록(T20)**. `deps.py`가 그 블록을 읽어 `EnsembleLLM` 인스턴스를 만들고 `ModelRouter`의 providers dict에 `ensemble_sql` 키로 등록한다. `agents.yaml`에는 ensemble 설정을 두지 않는다(중복 방지).
+
+**Wall-clock 영향:** SQL Generation 단계는 `max(GPT-OSS 응답, Gemma3 응답) ≈ GPT-OSS 응답시간`. 즉 단독 GPT-OSS 호출 대비 거의 추가 시간 없이 정확도 보강.
 
 ---
 
@@ -2054,14 +2050,14 @@ if conf < 0.7 and self._llm_light and self._renderer:
 return [SubQuery(id=str(uuid.uuid4()), agent=agent, query=message)]
 ```
 
-**설정:** `config/llm_routing.yaml`
+**설정:** `config/llm_routing.yaml` (T20에서 정식 정의, 여기서는 참조용)
 ```yaml
 routing:
-  planner: gemma4-4b        # 경량 모델, ~1~2초
-  schema_linking: gemma4-4b
-  sql_generation: gpt-oss
-  refine: gpt-oss
-  interpretation: gemma4-4b  # 또는 템플릿
+  planner:        gemma3                    # 경량, 분류
+  schema_linking: gemma3                    # 경량, 후보 선택
+  sql_generation: ensemble[gpt-oss, gemma3] # β: 병렬 ensemble (T16)
+  refine:         gpt-oss                   # 정확도, 조건부
+  interpretation: template                  # LLM 미사용 (필요 시 gemma3 fallback)
 ```
 
 **기대 효과:**
@@ -2077,28 +2073,54 @@ routing:
 
 ### T20. Multi-Model Task Routing (ModelRouter)
 
-**목적:** 파이프라인 각 단계에 최적 모델을 할당. 경량 모델로 교체 가능한 단계를 분리하여 전체 레이턴시 단축. 사내에 여러 GPT 모델이 존재하는 환경에 맞게 config 기반으로 교체 가능하게 구성.
+**목적:** 한 번의 사용자 질문이 거치는 4~5개 LLM 호출(Planner → Schema Linking → SQL Generation → (Refine) → Interpretation)에 **task별로 다른 모델**을 주입. 사내 가용 모델(Gemma3 / GPT-OSS / Gauss O3.2) 중 task 성격에 맞는 모델로 라우팅하여 정확도는 유지하고 레이턴시를 단축한다.
 
-**레이턴시 목표:**
+#### 0. Model Inventory & 라우팅 결정 근거 (β안 채택)
 
-| 구성 | 예상 P50 |
-|------|---------|
-| 현재 (모두 대형 모델, 4콜 순차) | ~20초 |
-| 경량 모델 Schema Linking + Interpretation | ~11초 |
-| + Interpretation 템플릿화 (LLM 콜 제거) | ~8초 |
-| + Query Log 캐시 히트 (T12) | <500ms |
+**사내 실측 응답 속도(SQL Generation 동일 프롬프트 기준):**
 
-**단계별 모델 권장 배정:**
+| 모델 | 실측 P50 | 비고 |
+|------|---------|------|
+| **Gemma3** | 가장 빠름 (~1~2초 추정) | 경량 분류·선택 task에 적합 |
+| **GPT-OSS** | 중간 (~5~8초 추정) | SQL 생성 정확도 안정. Phase 1 디폴트 |
+| **Gauss O3.2** | **60초 이상** | **런타임 경로에서 제외.** 오프라인 Golden Eval에만 사용 |
 
-| 단계 | 작업 성격 | 권장 모델 | 근거 |
-|------|----------|-----------|------|
-| Planner 분류 | 4-class 분류 | 경량 | 추론 깊이 불필요 |
-| Schema Linking | 후보 중 선택 | 경량 | 분류 태스크 |
-| SQL Generation | 복잡한 구조 추론 | 대형 | 가장 틀리기 쉬운 단계 |
-| Refine (조건부) | 오류 디버깅 | 대형 | 복잡한 수정 |
-| Interpretation | 자연어 생성 | 경량 or 템플릿 | 구조화 결과 → 템플릿 우선 |
+**Gauss O3.2 제외 사유:**
+- 60초+ 응답은 사용자 체감 속도 기준 미달 (현재 GPT-OSS 단독 ~20초도 느리다는 피드백).
+- Ensemble로 묶어도 **wall-clock = max(모델 응답시간)** 이라 가장 느린 쪽이 결정. Gauss를 ensemble에 넣으면 의미가 사라짐.
+- `eval_case.llm_model` 컬럼(T1 DDL)으로 오프라인 비교 평가만 수행 → 향후 Gauss가 추론 속도 개선되면 재평가.
 
-**신규 파일: `app/infra/llm/router.py`**
+**β 라우팅 전략 (채택안):**
+- **병렬 가능 단계(SQL Generation)** → Gemma3 + GPT-OSS **동시 호출 ensemble** (T16). 정확도 보강 + wall-clock 미증가.
+- **순차 단계(Planner / Schema Linking)** → 가장 빠른 **Gemma3 단독 고정**.
+- **조건부 단계(Refine)** → 정확도 우선 **GPT-OSS 단독**. 호출 빈도 낮음.
+- **Interpretation** → **템플릿 처리(LLM 미호출)**. 필요 시 Gemma3 fallback.
+
+**Construction-time DI 채택, 런타임 조회는 보류:**
+- `app/api/deps.py`에서 기동 시 `llm_routing.yaml` 읽고 컴포넌트별로 다른 `LLMProvider` 인스턴스를 주입. 라우팅 변경은 환경변수/설정 수정 후 재기동.
+- `config_version` 폴링 기반 핫리로드(설계 검토 단계의 B안)는 **이번 범위 밖**. 운영자가 비교 실험할 단계까지는 재기동 비용이 충분히 낮다.
+
+#### 1. 레이턴시 목표
+
+| 구성 | 예상 P50 | LLM 콜 수 |
+|------|---------|----------|
+| 현재 (GPT-OSS 단독, 4콜 순차) | ~20초 | 4 |
+| β: Gemma3 경량 + SQL Gen Ensemble + Template Interp | **~7~9초** | 5 (병렬 1쌍 포함) |
+| + Query Log 캐시 히트 (T12) | <500ms | 0 |
+
+#### 2. 단계별 모델 배정 (β)
+
+| 단계 | 작업 성격 | 모델 | 호출 형태 | 근거 |
+|------|----------|------|----------|------|
+| Planner 분류 | 4-class 분류 | Gemma3 | 단독 | 분류는 경량 LLM도 충분, 최속 우선 |
+| Schema Linking | 후보 중 선택 | Gemma3 | 단독 | 분류성 task |
+| SQL Generation | 복잡한 구조 추론 | **GPT-OSS ∥ Gemma3** | **Ensemble (T16)** | 정확도 핵심 단계, 병렬이라 wall-clock 미증가 |
+| Refine (조건부) | 오류 디버깅 | GPT-OSS | 단독 | 정확도 우선, 호출 빈도 낮음 |
+| Interpretation | 자연어 생성 | (템플릿) | LLM 미호출 | 구조화 결과 → 템플릿으로 충분 |
+
+#### 3. 신규 파일: `app/infra/llm/router.py`
+
+`ModelRouter`는 task 이름 → `LLMProvider` 매핑만 담당하는 얇은 래퍼. Ensemble은 별도 `EnsembleLLM`(T16)이 `LLMProvider` ABC를 구현하므로 **router 입장에서는 동일하게 단일 Provider로 취급**된다.
 
 ```python
 # app/infra/llm/router.py
@@ -2106,101 +2128,181 @@ routing:
 from app.infra.llm.base import LLMProvider
 
 class ModelRouter:
-    """task 이름 → LLMProvider 매핑. config로 모델 교체 가능."""
+    """task 이름 → LLMProvider 매핑. config로 모델/Ensemble 교체 가능."""
 
     def __init__(self, providers: dict[str, LLMProvider], routing: dict[str, str]):
-        # providers: {"gpt-oss": GptOssProvider(...), "gemma4-4b": GemmaProvider(...)}
-        # routing:   {"sql_generation": "gpt-oss", "schema_linking": "gemma4-4b", ...}
+        # providers: {
+        #   "gpt-oss":  InternalLLMProvider(model="gpt-oss"),
+        #   "gemma3":   InternalLLMProvider(model="gemma3"),
+        #   "ensemble_sql": EnsembleLLM(primary=gpt_oss, secondary=gemma3),  # T16
+        # }
+        # routing:   {
+        #   "planner":        "gemma3",
+        #   "schema_linking": "gemma3",
+        #   "sql_generation": "ensemble_sql",  # ← Ensemble도 Provider 키로 등록
+        #   "refine":         "gpt-oss",
+        # }
         self._providers = providers
         self._routing = routing
 
     def get(self, task: str) -> LLMProvider:
-        model_name = self._routing.get(task, "gpt-oss")  # 없으면 대형 모델 폴백
+        model_name = self._routing.get(task, "gpt-oss")  # 미정의 task는 정확도 모델로 폴백
         provider = self._providers.get(model_name)
         if provider is None:
             raise ValueError(f"Unknown model '{model_name}' for task '{task}'")
         return provider
 ```
 
-**설정 파일: `config/llm_routing.yaml`**
+**설계 의도:** `EnsembleLLM`이 `LLMProvider`를 implement하면 라우팅 표에서 단일 모델과 ensemble을 동일한 인터페이스로 다룰 수 있다. SQL Generation을 단독↔ensemble 전환할 때 `routing` 한 줄만 바꾸면 됨.
+
+#### 4. 설정 파일: `config/llm_routing.yaml`
 
 ```yaml
 # config/llm_routing.yaml
-# task별 사용 모델 매핑. 모델명은 .env의 LLM_MODEL_* 변수와 일치.
+# task별 사용 모델 매핑 (β안). 모델 키는 deps.py에서 등록한 providers dict의 키와 일치해야 함.
 routing:
-  planner:          gemma4-4b   # 경량, ~1초
-  schema_linking:   gemma4-4b   # 경량, ~2초
-  sql_generation:   gpt-oss     # 대형, ~7초 (핵심 단계)
-  refine:           gpt-oss     # 대형, 조건부 실행
-  interpretation:   template    # 템플릿 우선, 복잡한 경우만 gemma4-4b
+  planner:          gemma3         # 경량 분류
+  schema_linking:   gemma3         # 경량 후보 선택
+  sql_generation:   ensemble_sql   # GPT-OSS ∥ Gemma3 병렬 (T16 EnsembleLLM)
+  refine:           gpt-oss        # 정확도 우선, 조건부 호출
+  interpretation:   template       # LLM 미호출 (Interpreter가 routing 값 보고 분기)
 
 ensemble:
-  sql_generation:
-    enabled: false            # 비용 2배 → 기본 비활성화
-    models: [gpt-oss, gpt-oss-v2]
-    strategy: execution_majority
+  ensemble_sql:               # ← 이 키가 providers dict 등록 키이자 routing 값
+    enabled: true             # β 기본 ON (false면 deps.py가 routing.sql_generation을 primary로 자동 대체)
+    primary:   gpt-oss        # 정확도 우선 (불일치 시 채택)
+    secondary: gemma3         # 속도 우선 (병렬 비교용)
+    strategy: execution_jaccard  # 실행 결과 집합 유사도 (T16)
     timeout_sec: 12
     min_agreement: 0.8        # 이 이하면 active_learning_queue 등록
+
+# Gauss O3.2는 런타임 routing에 등록하지 않음. 오프라인 Golden Eval에서만 별도 사용.
 ```
 
-**`.env.example`에 추가:**
+**키 매핑 규칙:** `ensemble.<key>` 의 `<key>` 가 `providers` dict의 등록 키가 되고, `routing.<task>: <key>` 로 참조한다. 위 예시에서는 `ensemble_sql` 하나만 정의했지만 추후 `ensemble_refine` 등을 추가할 수 있다.
+
+#### 5. `.env.example` 추가
+
 ```bash
-# Multi-model (ModelRouter용)
-LLM_MODEL_LIGHT=gemma4-4b      # 경량 모델 (Planner, Schema Linking, Interpretation)
-LLM_MODEL_HEAVY=gpt-oss        # 대형 모델 (SQL Generation, Refine)
-LLM_API_BASE_URL_LIGHT=http://internal-llm-api/v1   # 경량 모델 엔드포인트 (대형과 다를 수 있음)
+# === Multi-model (ModelRouter용) ===
+# 두 모델은 동일 internal-llm-api endpoint에서 model 파라미터로 구분됨.
+LLM_API_BASE_URL=http://internal-llm-api/v1
+LLM_API_KEY=<secret>
+
+LLM_MODEL_FAST=gemma3          # Planner, Schema Linking — 최속 단독
+LLM_MODEL_ACCURATE=gpt-oss     # SQL Generation primary, Refine
+
+# (선택) 다른 endpoint 사용 시:
+# LLM_API_BASE_URL_FAST=http://internal-llm-api-gemma/v1
 ```
 
-**Agent에서 사용:**
+#### 6. 컴포넌트 주입 (Construction-time DI)
+
+기존 `SchemaLinker`/`SQLGenerator`/`SQLRefiner`/`ResultInterpreter`가 이미 `LLMProvider`를 생성자로 받는다(`app/core/agents/db/*.py`). **deps.py에서 task별로 다른 Provider를 주입**하면 끝 — 컴포넌트 코드 자체는 무변경.
+
 ```python
-# app/core/agents/db/agent.py
-class DBAgent(Agent):
-    def __init__(self, model_router: ModelRouter, ...):
-        self.router = model_router
+# app/api/deps.py (요지)
+def build_db_agent(settings, ...) -> DBAgent:
+    # 1) Provider 인스턴스화
+    gpt_oss = InternalLLMProvider(
+        base_url=settings.llm_api_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model_accurate,   # gpt-oss
+    )
+    gemma3 = InternalLLMProvider(
+        base_url=settings.llm_api_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model_fast,        # gemma3
+    )
+    ensemble_sql = EnsembleLLM(primary=gpt_oss, secondary=gemma3, tc_pool=tc_pool)
 
-    async def run(self, subquery, **kwargs):
-        schema_llm = self.router.get("schema_linking")   # 경량
-        sql_llm = self.router.get("sql_generation")       # 대형
-        interp_llm = self.router.get("interpretation")    # 경량 or template
+    # 2) llm_routing.yaml 로드
+    routing = load_yaml("config/llm_routing.yaml")["routing"]
+    providers = {"gpt-oss": gpt_oss, "gemma3": gemma3, "ensemble_sql": ensemble_sql}
+    router = ModelRouter(providers=providers, routing=routing)
 
-        linked = await self.schema_linker.link(subquery.query, llm=schema_llm)
-        sql = await self.sql_generator.generate(..., llm=sql_llm)
-        answer = await self._interpret(sql, rows, llm=interp_llm)
+    # 3) 컴포넌트별 Provider 주입 (기동 시점 1회)
+    return DBAgent(
+        linker     = SchemaLinker(llm=router.get("schema_linking"), ...),
+        generator  = SQLGenerator(llm=router.get("sql_generation"), ...),  # ← Ensemble
+        refiner    = SQLRefiner(llm=router.get("refine"), ...),
+        interpreter= ResultInterpreter(
+            llm=router.get("interpretation") if routing["interpretation"] != "template" else None,
+            template_only=(routing["interpretation"] == "template"),
+            ...,
+        ),
+        ...,
+    )
+
+# QueryPlanner도 동일하게 router.get("planner")를 주입.
 ```
 
-**인터프리테이션 템플릿화 (LLM 콜 -1):**
+**호출 시점에는 router 참조를 들지 않는다** — 각 컴포넌트는 자기 task에 맞는 단일 Provider만 알고 있으면 충분. 라우팅을 바꾸려면 yaml 수정 후 재기동.
+
+#### 7. Interpreter 템플릿 분기
+
+`interpretation: template`이면 `ResultInterpreter`는 LLM 호출 없이 즉시 결과 반환. routing 값 자체는 deps.py에서 `template_only` 플래그로 변환해 주입(컴포넌트가 yaml을 직접 읽지 않게).
+
 ```python
-# config 라우팅이 "template"이면 LLM 없이 처리
-def _interpret(self, sql, rows, llm) -> str:
-    if self.router._routing.get("interpretation") == "template":
-        return self._template_answer(sql, rows)  # 즉시 반환
-    return await llm.complete(self._interp_prompt(sql, rows))
+# app/core/agents/db/interpreter.py
+class ResultInterpreter:
+    def __init__(self, llm: LLMProvider | None, template_only: bool = False, ...):
+        self.llm = llm
+        self.template_only = template_only
 
-def _template_answer(self, sql: str, rows: list) -> str:
-    if not rows:
-        return "조회 결과가 없습니다."
-    col_names = list(rows[0].keys())
-    return f"총 {len(rows)}건 조회되었습니다. 주요 컬럼: {', '.join(col_names)}"
+    async def interpret(self, question, sql, rows) -> dict:
+        if self.template_only:
+            return self._template_answer(sql, rows)
+        prompt = self.renderer.render("result_interpret", question=question, sql=sql, rows=rows)
+        return await self.llm.complete_json(prompt)
+
+    def _template_answer(self, sql, rows) -> dict:
+        if not rows:
+            return {"answer": "조회 결과가 없습니다.", "confidence": 1.0}
+        col_names = list(rows[0].keys())
+        return {
+            "answer": f"총 {len(rows)}건 조회되었습니다. 주요 컬럼: {', '.join(col_names)}",
+            "confidence": 1.0,
+        }
 ```
 
-**주의사항:**
-1. **모델별 프롬프트 개별 튜닝 필요** — Gemma4는 few-shot 더 필요, GPT-OSS는 system prompt에 민감. Golden Eval에서 `llm_model` 컬럼(T1 DDL에 이미 있음)으로 모델별 점수 추적.
-2. **초기에는 routing 전체를 gpt-oss로** — ModelRouter 구조만 먼저 도입 후, 한 태스크씩 경량 교체하면서 Golden Eval 통과 확인. 교체 실패 시 즉시 롤백.
-3. **SQL Generation은 절대 경량 교체 금지** (정확도 핵심 단계).
+#### 8. 주의사항
 
-**테스트:** `tests/unit/test_model_router.py`
+1. **모델별 프롬프트 개별 튜닝 필요** — Gemma3는 few-shot 예시를 더 요구하는 경향, GPT-OSS는 system prompt에 민감. Golden Eval의 `eval_case.llm_model` 컬럼(T1 DDL)으로 모델별 점수를 분리 추적. SQL Generation은 ensemble의 두 모델이 동일 프롬프트를 공유하므로 Gemma3 친화적으로도 동작하는지 검증 필요.
+2. **점진적 도입 순서** — (a) ModelRouter + 두 Provider 등록 → (b) Planner/Schema Linking만 Gemma3로 교체 후 Golden Eval 통과 확인 → (c) Interpretation 템플릿화 → (d) SQL Generation Ensemble 활성화. 각 단계 회귀 시 routing yaml 한 줄 롤백.
+3. **SQL Generation 단독 Gemma3 교체 금지** — ensemble의 secondary로만 사용. 단독 Gemma3는 정확도 검증 전까지 routing에 두지 않는다.
+4. **Gauss O3.2는 routing에 등록하지 않는다** — 런타임 경로에서 영구 제외. 비교 평가는 Golden Eval 별도 실행으로 수행.
+5. **Ensemble timeout** — `timeout_sec: 12`. secondary(Gemma3)는 보통 더 빨리 끝나므로 거의 발동되지 않음. primary(GPT-OSS)가 12s를 넘으면 secondary 단독 결과로 fallback (T16 EnsembleLLM 동작 정의).
+
+#### 9. 테스트: `tests/unit/test_model_router.py`
+
 ```python
 def test_router_returns_correct_provider():
+    mock_gpt, mock_gemma = Mock(spec=LLMProvider), Mock(spec=LLMProvider)
     router = ModelRouter(
-        providers={"gpt-oss": mock_heavy, "gemma4-4b": mock_light},
-        routing={"sql_generation": "gpt-oss", "schema_linking": "gemma4-4b"},
+        providers={"gpt-oss": mock_gpt, "gemma3": mock_gemma},
+        routing={"sql_generation": "gpt-oss", "schema_linking": "gemma3"},
     )
-    assert router.get("sql_generation") is mock_heavy
-    assert router.get("schema_linking") is mock_light
+    assert router.get("sql_generation") is mock_gpt
+    assert router.get("schema_linking") is mock_gemma
 
-def test_router_fallback_to_heavy_for_unknown_task():
-    router = ModelRouter(providers=..., routing={})
-    assert router.get("unknown_task") is mock_heavy  # gpt-oss 폴백
+def test_router_returns_ensemble_as_provider():
+    mock_ensemble = Mock(spec=LLMProvider)  # EnsembleLLM도 LLMProvider
+    router = ModelRouter(
+        providers={"ensemble_sql": mock_ensemble, "gpt-oss": Mock()},
+        routing={"sql_generation": "ensemble_sql"},
+    )
+    assert router.get("sql_generation") is mock_ensemble
+
+def test_router_fallback_to_accurate_for_unknown_task():
+    mock_gpt = Mock(spec=LLMProvider)
+    router = ModelRouter(providers={"gpt-oss": mock_gpt}, routing={})
+    assert router.get("unknown_task") is mock_gpt  # gpt-oss 폴백
+
+def test_router_raises_on_unknown_provider():
+    router = ModelRouter(providers={"gpt-oss": Mock()}, routing={"x": "missing"})
+    with pytest.raises(ValueError, match="Unknown model"):
+        router.get("x")
 ```
 
 ---
@@ -2246,7 +2348,6 @@ def test_router_fallback_to_heavy_for_unknown_task():
 | `config/prompts/sql_gen.j2` | 수정 (anti-pattern 섹션 추가) | T14 |
 | `db/migrations/007_active_learning.sql` | 신규 | T15 |
 | `app/infra/db/active_learning_repo.py` | 신규 | T15 |
-| `app/infra/llm/ensemble.py` | 신규 | T16 |
 | `app/core/agents/db/ast_repair.py` | 신규 | T17 |
 | `tests/unit/test_ast_repair.py` | 신규 | T17 |
 | `requirements.txt` | 수정 (sqlglot, rapidfuzz 추가) | T10, T13, T17 |
@@ -2260,10 +2361,13 @@ def test_router_fallback_to_heavy_for_unknown_task():
 | `tests/unit/test_planner_prefilter.py` | 신규 | T18 |
 | `config/prompts/planner.j2` | 신규 | T19 |
 | `tests/unit/test_planner_confidence.py` | 신규 | T19 |
-| `app/infra/llm/router.py` | 신규 | T20 |
-| `config/llm_routing.yaml` | 신규 | T20 |
-| `.env.example` | 수정 (LLM_MODEL_LIGHT, LLM_MODEL_HEAVY 추가) | T20 |
-| `tests/unit/test_model_router.py` | 신규 | T20 |
+| `app/infra/llm/router.py` | 신규 (`ModelRouter`) | T20 |
+| `app/infra/llm/ensemble.py` | 신규 (`EnsembleLLM`, `LLMProvider` 구현) | T16 |
+| `config/llm_routing.yaml` | 신규 (β안: SQL Gen ensemble + 나머지 Gemma3) | T16, T20 |
+| `.env.example` | 수정 (`LLM_MODEL_FAST=gemma3`, `LLM_MODEL_ACCURATE=gpt-oss`) | T20 |
+| `app/api/deps.py` | 수정 (Provider 2종 + EnsembleLLM 등록, 컴포넌트별 Provider 주입) | T16, T20 |
+| `app/core/agents/db/interpreter.py` | 수정 (`template_only` 분기 추가) | T20 |
+| `tests/unit/test_model_router.py` | 신규 (단독/ensemble/폴백/오류 케이스) | T20 |
 
 ---
 
@@ -2289,7 +2393,8 @@ def test_router_fallback_to_heavy_for_unknown_task():
 | + Schema Linker 2단계 (T11) | ? | ? | ? | ? |
 | + Self-Consistency N=3 (T8) | ? | ? | ? | ? |
 | + Planner Pre-filter (T18) | - | - | - | ~100ms (잡담) |
-| + ModelRouter 경량 분리 (T20) | ? | ? | ? | ~8~12초 (일반) |
+| + ModelRouter β: Gemma3 분리 + Interp 템플릿 (T20) | ? | ? | ? | ~8~12초 |
+| + SQL Gen Ensemble GPT-OSS∥Gemma3 (T16, β 기본 ON) | ? | ? | ? | ~7~9초 |
 | Full System (모두 적용) | ? | ? | ? | ? |
 
 > **측정 방법:** 각 구성을 별도 git 브랜치에서 Golden Eval 실행 → `eval_run.git_sha`로 추적. 논문 Table 1로 활용.
