@@ -252,7 +252,234 @@ Production-oriented / domain-specific Text-to-SQL system paper
 5. latency / accuracy / fallback / valid SQL 측정
 6. 실패 사례 정리
 
-## 12. 실무 관점 최종 판단
+## 12. 실험은 어떻게 진행하는 것이 좋은가
+
+논문화까지 고려하면 실험은 단순히 "좋아졌다"를 보는 방식이 아니라,  
+"무엇이 얼마나 좋아졌고, 그 대가로 무엇이 늘었는가"를 보여주는 방식으로 진행하는 것이 좋다.
+
+### 12-1. 실험 단계
+
+가장 추천하는 순서는 아래와 같다.
+
+#### Stage A. Baseline 고정
+
+최소 2개 baseline을 준비한다.
+
+1. **Direct baseline**
+
+```text
+Question + Full Schema
+  -> LLM
+  -> SQL
+  -> Execute
+```
+
+2. **Basic production baseline**
+
+```text
+Question
+  -> Schema Linking
+  -> SQL Generation
+  -> Execute / Repair
+```
+
+이 두 개를 고정해 두면,  
+현재 제안 구조가 단순 프롬프트 개선인지, 구조적 개선인지 비교가 가능해진다.
+
+#### Stage B. Incremental ablation
+
+구성요소를 한 번에 다 넣지 말고 아래처럼 순차적으로 켠다.
+
+```text
+B0: Basic production baseline
+B1: + ValueStore (T3)
+B2: + Few-shot expansion (T4)
+B3: + Schema description improvement (T5)
+B4: + SQL prompt improvement (T6)
+B5: + Schema linker 2-stage (T11)
+B6: + Fuzzy value matching (T13)
+B7: + Anti-pattern few-shot (T14)
+B8: + Verification / AST repair (T9, T17)
+B9: + Planner 3-tier (T19)
+B10: + Model routing (T20)
+B11: + SQL ensemble (T16)
+```
+
+핵심은:
+- 한 번에 하나 또는 논리적으로 묶인 소수만 켜기
+- 각 단계마다 metric 변화 기록
+
+#### Stage C. 최종 full system
+
+모든 개선을 켠 최종 시스템을 baseline과 비교한다.
+
+### 12-2. 데이터 분리
+
+가장 중요한 원칙은 **train / dev / eval 분리**다.
+
+권장:
+
+- `train`
+  - classifier 학습
+  - few-shot seed 설계
+  - planner seed 데이터
+- `dev`
+  - threshold tuning
+  - calibration
+  - prompt 수정 반복
+- `eval`
+  - 최종 성능 보고용
+  - 논문 표/그림용
+
+중요:
+- Golden dataset 전체를 학습에 쓰면 안 된다.
+- 특히 planner classifier나 few-shot seed를 만들 때 eval 오염을 조심해야 한다.
+
+### 12-3. 실험군을 나누는 방식
+
+실험군은 아래 축으로 나누는 것이 좋다.
+
+#### 1. 구조 축
+
+- direct baseline
+- production baseline
+- proposed system
+
+#### 2. difficulty 축
+
+- easy
+- medium
+- hard
+
+#### 3. 질의 유형 축
+
+- 단순 조회
+- 설명형 질문
+- 다조건 필터
+- 값 정규화 필요
+- schema ambiguity
+- mixed intent
+
+#### 4. 실패 유형 축
+
+- invalid SQL
+- empty result
+- wrong table
+- wrong column
+- wrong value normalization
+- wrong aggregation
+
+### 12-4. 필수 지표
+
+적어도 아래는 함께 보고하는 것이 좋다.
+
+#### 정확도 계열
+
+- Execution Accuracy
+- Valid SQL Rate
+- Component Match
+- Hard subset accuracy
+
+#### 운영 계열
+
+- P50 latency
+- P95 latency
+- Planner fallback rate
+- Human review rate
+- Empty-result refine success rate
+
+#### planner 전용
+
+- classifier-only decision rate
+- classifier ECE
+- mixed intent precision / recall
+
+### 12-5. 추천 표 구조
+
+#### Table 1. Main comparison
+
+| System | EX | Valid SQL | Component Match | P50 Latency | P95 Latency |
+|--------|----|-----------|-----------------|-------------|-------------|
+| Direct baseline | - | - | - | - | - |
+| Production baseline | - | - | - | - | - |
+| Proposed system | - | - | - | - | - |
+
+#### Table 2. Ablation
+
+| Variant | EX | Valid SQL | Hard EX | Latency | Notes |
+|--------|----|-----------|---------|---------|------|
+| B0 | - | - | - | - | baseline |
+| B1 | - | - | - | - | + ValueStore |
+| B2 | - | - | - | - | + Few-shot |
+| ... | ... | ... | ... | ... | ... |
+
+#### Table 3. Planner quality
+
+| Variant | Classifier-only Rate | Fallback Rate | Mixed Precision | Planner Latency |
+|--------|----------------------|---------------|-----------------|-----------------|
+| rule only | - | - | - | - |
+| classifier + fallback | - | - | - | - |
+
+### 12-6. 실험 중 꼭 봐야 하는 trade-off
+
+정확도만 보면 안 되고 아래 trade-off를 같이 봐야 한다.
+
+1. EX가 올라갔는데 latency가 크게 늘었는가
+2. Valid SQL은 올라갔지만 empty result가 늘었는가
+3. planner fallback rate가 줄었지만 mixed intent 오분류가 늘었는가
+4. SQL ensemble이 accuracy는 올렸지만 운영 비용이 과한가
+
+즉, 단일 점수보다 multi-metric trade-off로 해석해야 한다.
+
+### 12-7. 실패 사례 분석 방법
+
+논문에서는 정량 결과만으로는 부족하고 실패 사례 분석이 중요하다.
+
+추천 방식:
+
+1. eval 실패 케이스를 유형별로 분류
+   - schema ambiguity
+   - value mismatch
+   - join failure
+   - aggregation error
+   - planner misroute
+
+2. 각 유형별 대표 사례 2~3개 선정
+
+3. baseline vs proposed system 차이 설명
+
+예시:
+- baseline은 `PARAM_A가 뭐야?`를 `db`로 보내지만
+- proposed planner는 `doc`으로 보내어 오분류를 줄임
+
+### 12-8. 운영형 실험도 같이 보는 것이 좋다
+
+오프라인 eval만으로 끝내지 말고 운영형 지표도 함께 보는 것이 좋다.
+
+예:
+- 실제 traffic sample에서 fallback rate 추이
+- drift 발생 시 classifier confidence 변화
+- active learning queue 누적 패턴
+
+이건 "운영형 Text-to-SQL" 논문 포지션에 특히 중요하다.
+
+### 12-9. 가장 현실적인 최소 실험 세트
+
+시간이 부족하면 최소한 아래는 해야 한다.
+
+1. Direct baseline vs production baseline vs proposed system
+2. 3~5개 핵심 ablation
+   - `T5`
+   - `T11`
+   - `T13`
+   - `T19`
+   - `T20`
+3. EX / Valid SQL / Latency
+4. 실패 사례 5~10개 정성 분석
+
+이 정도만 되어도 초안 수준 논문 뼈대는 나온다.
+
+## 13. 실무 관점 최종 판단
 
 정리하면:
 
