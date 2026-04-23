@@ -46,8 +46,8 @@
 | T15 | Active Learning Loop (저신뢰 케이스 큐) | 신규 | 2h |
 | T16 | Multi-model Ensemble (GPT-OSS + Gemma3, SQL Generation 전용·β 기본 ON) | 신규 | 2h |
 | T17 | SQL AST 정적 수정 (sqlglot) | 신규 | 1.5h |
-| T18 | QueryPlanner Pre-filter + SmallTalkAgent (잡담/인사 라우팅) | 신규 | 1.5h |
-| T19 | QueryPlanner Rule 신뢰도 스코어링 + 경량 LLM 분류기 | 수정 | 2h |
+| T18 | QueryPlanner Pre-filter + SmallTalkAgent (exclusion-only) | 신규 | 1.5h |
+| T19 | Prefilter + SetFit Classifier + LLM Fallback (3-tier Planner) | 수정 | 2h |
 | T20 | Multi-Model Task Routing (ModelRouter + per-task 모델 할당) | 신규 | 2h |
 
 ### 이번에 구현하지 않는 것
@@ -1850,7 +1850,7 @@ def test_limit_auto_injection():
 
 ---
 
-### T18. QueryPlanner Pre-filter + SmallTalkAgent (잡담/인사 라우팅)
+### T18. QueryPlanner Pre-filter + SmallTalkAgent (exclusion-only)
 
 **목적:** 현재 QueryPlanner의 default="db" 구조로 인해 "안녕", "고마워" 같은 잡담도 Text-to-SQL 파이프라인(20초)으로 진입하는 버그 해결. Pre-filter로 즉시 분기하여 100ms 내 응답.
 
@@ -1982,7 +1982,12 @@ def test_db_question_passes_through():
 
 ---
 
-### T19. QueryPlanner Rule 신뢰도 스코어링 + 경량 LLM 분류기
+### T19. 이전 초안 메모
+
+이 위치의 기존 초안(rule confidence + 경량 LLM 분류기)은 채택하지 않는다.  
+아래의 `T19. Prefilter + SetFit Classifier + LLM Fallback (3-tier Planner)` 섹션을 최종안으로 본다.
+
+---
 
 **목적:** 현재 `_classify_rule()` 은 매칭 여부만 판단하고 신뢰도를 반환하지 않음. default="db"로 낙찰되는 애매한 케이스를 경량 LLM에 위임하여 정확도 향상. 대형 LLM은 쓰지 않음.
 
@@ -2053,7 +2058,8 @@ return [SubQuery(id=str(uuid.uuid4()), agent=agent, query=message)]
 **설정:** `config/llm_routing.yaml` (T20에서 정식 정의, 여기서는 참조용)
 ```yaml
 routing:
-  planner:        gemma3                    # 경량, 분류
+  planner_fallback: gemma3                  # 저신뢰 / OOD fallback
+  planner_decompose: gpt-oss                # mixed intent 분해
   schema_linking: gemma3                    # 경량, 후보 선택
   sql_generation: ensemble[gpt-oss, gemma3] # β: 병렬 ensemble (T16)
   refine:         gpt-oss                   # 정확도, 조건부
@@ -2068,6 +2074,150 @@ routing:
 | "L01 설비가 이상해" | db (오분류) | log (경량 LLM 정분류, +1~2초) |
 | "EQPID가 뭐야?" | doc (패턴 매치) | doc (동일, 0초) |
 | "L01 라인 설비 목록" | db (고신뢰 rule) | db (0초) |
+
+---
+
+### T19. Prefilter + SetFit Classifier + LLM Fallback (3-tier Planner)
+
+**채택안:** 기존 T19(rule confidence + 경량 LLM) 초안을 대체하는 Planner 재설계안.  
+핵심은 `prefilter -> classifier -> LLM fallback/decompose` 의 3-tier 구조로 역할을 분리하는 것이다.
+
+#### 1. 설계 원칙
+
+- `Prefilter` 는 **exclusion-only** 이다.
+  - 인사, 감사, 빈 입력, 3자 미만, `/command`, meta 입력만 처리
+  - `db/doc/log/knowledge` 본분류는 하지 않음
+- `Classifier` 는 **in-distribution 4-class 분류** 만 담당한다.
+  - 라벨: `db`, `doc`, `log`, `knowledge`
+- `LLM fallback` 은 **저신뢰 / OOD / mixed intent 분해** 만 담당한다.
+
+#### 2. Tier 역할 분리
+
+| Tier | 책임 | 목표 기준 | 하지 말아야 할 것 |
+|------|------|-----------|-------------------|
+| Prefilter (rule, <1ms) | 인사/감사/빈 입력/명백한 off-domain 배제 | Recall 99%+ | 본분류 수행 금지 |
+| Classifier (SetFit, ~20~50ms) | 정상 업무 질문 4-class 분류 | Macro-F1 >= 0.90, abstain <= 20% | mixed intent 분해 시도 금지 |
+| LLM Fallback (~1~2s) | 저신뢰/OOD/mixed intent 처리 | 호출 빈도 <= 20% | 항상 정답 취급 금지 |
+
+#### 3. 추천 플로우
+
+```text
+prefilter
+  -> smalltalk / reject 이면 즉시 반환
+  -> 아니면 SetFit classifier
+      -> high confidence single-class 이면 바로 반환
+      -> low confidence or high entropy 이면 LLM fallback
+          -> 단일 intent면 1개 SubQuery
+          -> mixed intent면 여러 SubQuery 로 분해
+```
+
+```python
+# QueryPlanner.plan_async()
+pre = prefilter(message)
+if pre in ("smalltalk", "reject"):
+    return [SubQuery(id=str(uuid.uuid4()), agent=pre, query=message)]
+
+label, score, margin, entropy = self.intent_classifier.predict(message)
+if score >= self.threshold_high and margin >= self.threshold_margin and entropy < self.entropy_high:
+    return [SubQuery(id=str(uuid.uuid4()), agent=label, query=message)]
+
+# 저신뢰 / OOD / mixed intent
+if self._llm_fallback and self._renderer:
+    ...
+```
+
+#### 4. Classifier 선택
+
+**권장 기본안**
+- 1단계: frozen embedding + centroid 또는 head-only classifier
+- 2단계: dev 성능 부족 시 SetFit head-only
+- 3단계: 정말 필요할 때만 full SetFit fine-tune 검토
+
+**SetFit 예시 학습 라벨**
+- `"A 설비 parameter 있어?"` -> `db`
+- `"B 기능은 어떤식으로 동작해"` -> `doc`
+- `"C Lot이 A 설비에서 멈췄는데 뭐가 문제야?"` -> `log`
+
+**주의**
+- `tests/golden/datasets/*` 를 그대로 학습셋으로 쓰지 않는다.
+- `train / dev / eval` split 을 분리하고 Golden Eval 은 최종 holdout 으로 유지한다.
+
+#### 5. Confidence / fallback 기준
+
+Raw score 하나만 보지 않고 **top1 + margin + entropy** 를 함께 사용한다.
+
+```text
+accept if:
+  top1_prob >= theta_high
+  AND (top1_prob - top2_prob) >= theta_margin
+  AND entropy < theta_entropy
+```
+
+권장 시작값:
+- `theta_high = 0.80`
+- `theta_margin = 0.15`
+- `theta_entropy = 0.85`
+
+추가로 dev set 에서 calibration(Platt scaling 또는 isotonic regression) 을 수행한다.
+
+#### 6. Mixed intent 처리
+
+`QueryPlanner` 반환 타입이 이미 `list[SubQuery]` 이므로 스키마 변경은 없다.  
+classifier 는 mixed intent 를 **감지만** 하고, 실제 분해는 `planner_decompose` 프롬프트를 사용하는 LLM 이 수행한다.
+
+**mixed detect signal**
+1. calibrated distribution entropy 가 높음
+2. top-2 확률이 모두 높음
+3. `"그리고"`, `"또한"`, `"그리고 나서"` 같은 접속사
+4. 문장 부호/줄바꿈으로 다중 요청 가능성
+
+위 신호 중 2개 이상이면 mixed 처리한다.
+
+```python
+# config/prompts/planner_decompose.j2 (신규)
+당신은 사용자의 질문을 단일 intent sub-query 목록으로 분해하는 planner 입니다.
+
+가능한 agent:
+- db
+- doc
+- log
+- knowledge
+
+규칙:
+- 각 sub_query 는 하나의 intent 만 가져야 한다.
+- 분해가 불가능하면 원문 그대로 1개만 반환한다.
+
+질문: {{ question }}
+
+JSON만 반환:
+{"sub_queries":[{"agent":"db","query":"..."}, {"agent":"log","query":"..."}]}
+```
+
+#### 7. 운영 지표
+
+| 지표 | 목표 |
+|------|------|
+| Classifier-only decision rate | >= 80% |
+| LLM fallback rate | <= 20% |
+| Classifier ECE | <= 0.05 |
+| Mixed intent detection precision | >= 0.85 |
+
+#### 8. 신규 파일 / 변경 범위
+
+- `app/core/orchestrator/intent_classifier.py`
+- `scripts/train_planner.py`
+- `config/planner_seeds.yaml`
+- `config/prompts/planner_decompose.j2`
+- `config/prompts/planner.j2` (fallback classifier prompt로 축소)
+
+#### 9. 기대 효과
+
+| 케이스 | 기존 | 개선 후 |
+|--------|------|---------|
+| `"안녕"` | db 또는 planner LLM | prefilter -> smalltalk (<1ms) |
+| `"L01 설비가 이상해"` | db 오분류 가능 | classifier -> log (~수십 ms) |
+| `"EQPID가 뭐야?"` | rule 의존 | classifier -> doc |
+| `"A 설비 parameter 바뀐 거랑 멈춘 원인도 봐줘"` | 단일 class 강제 | mixed detect -> LLM decomposer |
 
 ---
 
@@ -2112,7 +2262,8 @@ routing:
 
 | 단계 | 작업 성격 | 모델 | 호출 형태 | 근거 |
 |------|----------|------|----------|------|
-| Planner 분류 | 4-class 분류 | Gemma3 | 단독 | 분류는 경량 LLM도 충분, 최속 우선 |
+| Planner fallback | 저신뢰 / OOD 분류 | Gemma3 | 단독 | classifier 저신뢰 시만 호출 |
+| Planner decompose | mixed intent 분해 | GPT-OSS | 단독 | 분해 품질 우선 |
 | Schema Linking | 후보 중 선택 | Gemma3 | 단독 | 분류성 task |
 | SQL Generation | 복잡한 구조 추론 | **GPT-OSS ∥ Gemma3** | **Ensemble (T16)** | 정확도 핵심 단계, 병렬이라 wall-clock 미증가 |
 | Refine (조건부) | 오류 디버깅 | GPT-OSS | 단독 | 정확도 우선, 호출 빈도 낮음 |
@@ -2161,7 +2312,8 @@ class ModelRouter:
 # config/llm_routing.yaml
 # task별 사용 모델 매핑 (β안). 모델 키는 deps.py에서 등록한 providers dict의 키와 일치해야 함.
 routing:
-  planner:          gemma3         # 경량 분류
+  planner_fallback: gemma3         # 저신뢰 / OOD fallback
+  planner_decompose: gpt-oss       # mixed intent 분해
   schema_linking:   gemma3         # 경량 후보 선택
   sql_generation:   ensemble_sql   # GPT-OSS ∥ Gemma3 병렬 (T16 EnsembleLLM)
   refine:           gpt-oss        # 정확도 우선, 조건부 호출
@@ -2189,7 +2341,7 @@ ensemble:
 LLM_API_BASE_URL=http://internal-llm-api/v1
 LLM_API_KEY=<secret>
 
-LLM_MODEL_FAST=gemma3          # Planner, Schema Linking — 최속 단독
+LLM_MODEL_FAST=gemma3          # planner_fallback, schema_linking
 LLM_MODEL_ACCURATE=gpt-oss     # SQL Generation primary, Refine
 
 # (선택) 다른 endpoint 사용 시:
@@ -2356,10 +2508,13 @@ def test_router_raises_on_unknown_provider():
 
 | 파일 | 변경 유형 | 태스크 |
 |------|----------|--------|
-| `app/core/orchestrator/planner.py` | 수정 (prefilter, confidence scoring, 경량 LLM 분류) | T18, T19 |
+| `app/core/orchestrator/planner.py` | 수정 (prefilter, classifier 연동, fallback / decompose 분기) | T18, T19 |
 | `app/core/agents/smalltalk/agent.py` | 신규 | T18 |
 | `tests/unit/test_planner_prefilter.py` | 신규 | T18 |
-| `config/prompts/planner.j2` | 신규 | T19 |
+| `config/prompts/planner.j2` | 신규 (fallback classifier prompt) | T19 |
+| `config/prompts/planner_decompose.j2` | 신규 | T19 |
+| `config/planner_seeds.yaml` | 신규 | T19 |
+| `app/core/orchestrator/intent_classifier.py` | 신규 | T19 |
 | `tests/unit/test_planner_confidence.py` | 신규 | T19 |
 | `app/infra/llm/router.py` | 신규 (`ModelRouter`) | T20 |
 | `app/infra/llm/ensemble.py` | 신규 (`EnsembleLLM`, `LLMProvider` 구현) | T16 |
@@ -2500,7 +2655,7 @@ GROUP BY c.difficulty;
 **그 다음 할 것**
 - T11 two-stage schema linker
 - T13 fuzzy value matching
-- T19 planner confidence + light-model fallback
+- T19 planner 3-tier (prefilter + classifier + LLM fallback)
 - T20 model router
 
 T20은 처음부터 모델을 나누지 말고, 우선 같은 모델로 routing 구조만 넣은 뒤 eval 결과가 확인되면 분리하는 것이 안전하다.
