@@ -1,0 +1,16 @@
+사용자 질문을 필요한 작업 단위로 나누세요.
+
+사용 가능한 agent:
+- db: DB 조회
+- doc: 문서 검색
+- log: 로그 분석
+- knowledge: 지식베이스
+
+질문: {{ question }}
+
+JSON만 출력하세요.
+{
+  "sub_queries": [
+    {"agent": "db|doc|log|knowledge", "query": "하위 질문"}
+  ]
+}

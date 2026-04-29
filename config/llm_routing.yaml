@@ -1,0 +1,10 @@
+routing:
+  planner_fallback: fast
+  planner_decompose: accurate
+  schema_linking: fast
+  sql_generation: accurate
+  refine: accurate
+  interpretation: accurate
+  knowledge: accurate
+
+default_provider: accurate

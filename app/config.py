@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     llm_api_base_url: str = "http://localhost:8080/v1"
     llm_api_key: str = ""
     llm_model: str = "gpt-oss"
+    llm_model_fast: str = "gpt-oss"
+    llm_model_accurate: str = "gpt-oss"
 
     # MySQL App DB (세션/메시지/feedback/few_shot)
     app_db_host: str = "localhost"

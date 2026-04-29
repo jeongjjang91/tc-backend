@@ -1,0 +1,4 @@
+confidence_threshold: 0.55
+margin_threshold: 0.15
+entropy_threshold: 1.25
+classifier_mode: keyword

@@ -1,5 +1,6 @@
 from app.config import get_settings
 from app.infra.llm.internal_api import InternalLLMProvider
+from app.infra.llm.router import ModelRouter
 from app.infra.llm.prompt_renderer import PromptRenderer
 from app.infra.db.mysql import MySQLPool
 from app.infra.db.schema_store import SchemaStore
@@ -20,8 +21,10 @@ from app.core.agents.db.agent import DBAgent
 from app.core.agents.rag.agent import RAGAgent
 from app.core.agents.log.agent import SplunkAgent
 from app.core.agents.knowledge.agent import KnowledgeAgent
+from app.core.agents.smalltalk.agent import SmallTalkAgent
 from app.infra.db.knowledge_repo import KnowledgeRepository
-from app.core.orchestrator.planner import QueryPlanner
+from app.core.orchestrator.intent_classifier import KeywordIntentClassifier
+from app.core.orchestrator.planner import PlannerThresholds, QueryPlanner
 from app.core.orchestrator.executor import QueryExecutor
 from app.infra.db.table_service import TableService
 
@@ -33,6 +36,8 @@ _review_repo: ReviewRepository | None = None
 _planner: QueryPlanner | None = None
 _executor: QueryExecutor | None = None
 _table_service: TableService | None = None
+_knowledge_agent: KnowledgeAgent | None = None
+_smalltalk_agent: SmallTalkAgent | None = None
 
 
 async def get_db_agent() -> DBAgent:
@@ -68,15 +73,28 @@ async def get_table_service() -> TableService:
 
 
 async def init_dependencies() -> None:
-    global _db_agent, _rag_agent, _splunk_agent, _session_repo, _review_repo, _planner, _executor, _table_service
+    global _db_agent, _rag_agent, _splunk_agent, _session_repo, _review_repo, _planner, _executor, _table_service, _knowledge_agent, _smalltalk_agent
     s = get_settings()
     loader = ConfigLoader(s.config_dir)
     thresholds = loader.load_thresholds()
     whitelist = loader.load_whitelist()
     schema_data = loader.load_schema()
     seed_data = loader.load_few_shot_seed()
+    planner_cfg = loader.load_planner()
+    planner_seed_data = loader.load_planner_seeds()
+    routing_cfg = loader.load_llm_routing()
 
-    llm = InternalLLMProvider(s.llm_api_base_url, s.llm_api_key, s.llm_model)
+    providers = {
+        "fast": InternalLLMProvider(s.llm_api_base_url, s.llm_api_key, s.llm_model_fast or s.llm_model),
+        "accurate": InternalLLMProvider(s.llm_api_base_url, s.llm_api_key, s.llm_model_accurate or s.llm_model),
+        "default": InternalLLMProvider(s.llm_api_base_url, s.llm_api_key, s.llm_model),
+    }
+    router = ModelRouter(
+        providers=providers,
+        routing=routing_cfg.get("routing", {}),
+        default_provider=routing_cfg.get("default_provider", "accurate"),
+    )
+    llm = providers["default"]
     renderer = PromptRenderer(f"{s.config_dir}/prompts")
 
     schema_store = SchemaStore()
@@ -104,11 +122,11 @@ async def init_dependencies() -> None:
     _review_repo = ReviewRepository(app_pool)
 
     _db_agent = DBAgent(
-        linker=SchemaLinker(llm, renderer, schema_store, thresholds.get("schema_rag_top_k", 5)),
-        generator=SQLGenerator(llm, renderer, few_shot_store, value_store, thresholds.get("few_shot_top_k", 3)),
+        linker=SchemaLinker(router.get("schema_linking"), renderer, schema_store, thresholds.get("schema_rag_top_k", 5)),
+        generator=SQLGenerator(router.get("sql_generation"), renderer, few_shot_store, value_store, thresholds.get("few_shot_top_k", 3)),
         validator=validator,
-        refiner=SQLRefiner(llm, renderer, thresholds.get("max_refine_attempts", 2)),
-        interpreter=ResultInterpreter(llm, renderer),
+        refiner=SQLRefiner(router.get("refine"), renderer, thresholds.get("max_refine_attempts", 2)),
+        interpreter=ResultInterpreter(router.get("interpretation"), renderer),
         tc_pool=tc_pool,
         few_shot_store=few_shot_store,
         schema_store=schema_store,
@@ -146,15 +164,31 @@ async def init_dependencies() -> None:
 
     knowledge_repo = KnowledgeRepository(app_pool)
     _knowledge_agent = KnowledgeAgent(
-        llm=llm,
+        llm=router.get("knowledge"),
         renderer=renderer,
         knowledge_repo=knowledge_repo,
         top_k=thresholds.get("knowledge_top_k", 5),
     )
+    _smalltalk_agent = SmallTalkAgent()
 
     _table_service = TableService(tc_pool=tc_pool, whitelist=whitelist)
 
-    _planner = QueryPlanner(llm=llm, renderer=renderer)
+    _planner = QueryPlanner(
+        llm=router.get("planner_fallback"),
+        renderer=renderer,
+        intent_classifier=KeywordIntentClassifier(planner_seed_data),
+        thresholds=PlannerThresholds(
+            confidence=planner_cfg.get("confidence_threshold", 0.55),
+            margin=planner_cfg.get("margin_threshold", 0.15),
+            entropy=planner_cfg.get("entropy_threshold", 1.25),
+        ),
+    )
     _executor = QueryExecutor(
-        agent_instances={"db": _db_agent, "doc": _rag_agent, "log": _splunk_agent, "knowledge": _knowledge_agent}
+        agent_instances={
+            "db": _db_agent,
+            "doc": _rag_agent,
+            "log": _splunk_agent,
+            "knowledge": _knowledge_agent,
+            "smalltalk": _smalltalk_agent,
+        }
     )

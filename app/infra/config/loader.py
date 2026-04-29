@@ -29,3 +29,12 @@ class ConfigLoader:
 
     def load_agents(self) -> dict:
         return self._load("agents.yaml")
+
+    def load_planner(self) -> dict:
+        return self._load("planner.yaml")
+
+    def load_planner_seeds(self) -> dict:
+        return self._load("planner_seeds.yaml")
+
+    def load_llm_routing(self) -> dict:
+        return self._load("llm_routing.yaml")
